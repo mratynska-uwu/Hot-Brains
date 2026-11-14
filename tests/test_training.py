@@ -27,13 +27,14 @@ def test_stream_ready_requires_recent_sdk_frames(monkeypatch):
     try:
         assert not device.stream_ready()
         device.connected = True  # SDK opened, but no frames yet.
+        device.pipeline = type("PipelineStub", (), {"get_condition": lambda self: "Healthy"})()
         assert not device.stream_ready()
-        with pytest.raises(ValueError, match="Non-finite"):
-            device.ring.append(np.full((EEG.fs, N_CH), np.nan), 0)
-        assert device.ring.received_samples == 0
-        device.ring.append(np.ones((EEG.fs // 2 - 1, N_CH)), 0)
+        device.ring.append(np.full((EEG.fs, N_CH), np.nan))
+        assert device.ring.received_samples == EEG.fs
         assert not device.stream_ready()
-        device.ring.append(np.ones((1, N_CH)), 0)
+        device.ring.append(np.ones((EEG.fs // 2 - 1, N_CH)))
+        assert not device.stream_ready()
+        device.ring.append(np.ones((1, N_CH)))
         assert device.stream_ready()
         with device.ring._lock:
             device.ring._last_arrival -= 2
@@ -234,15 +235,25 @@ def test_forest_prequential_probabilities_and_selective_save(tmp_path):
 
 def test_bursty_frame_arrivals_preserve_a_complete_epoch(monkeypatch):
     ring = SampleRing(channels=EEG.device_channels)
-    callback_times = iter(100.012 + .016 * i + (.03 if i % 2 else -.02) for i in range(63))
+    callback_times = iter(100.012 + .016 * i + (.03 if i % 2 else -.02) for i in range(65))
     monkeypatch.setattr("hotbrain.acquisition.time.perf_counter", lambda: next(callback_times))
-    signal = np.tile(np.arange(250, dtype=float)[:, None], (1, 8))
-    for first in range(0, 250, 4):
-        ring.append(signal[first:first + 4], 0)
+    signal = np.tile(np.arange(260, dtype=float)[:, None], (1, 8))
+    marker_code = 101
+    for first in range(0, 260, 4):
+        frame = np.column_stack((signal[first:first + 4], np.zeros(4)))
+        if first <= 75 < first + len(frame):
+            frame[75 - first, -1] = marker_code
+        ring.append(frame, marker_channel=8)
     spec = EpochSpec()
-    epoch = ring.epoch(100.2, spec)
+    epoch = ring.epoch(marker_code, spec)
     assert epoch is not None
     assert epoch.shape == (spec.n_samples, N_CH)
+    assert ring.marker_sample(marker_code) == 75
+    assert ring.eeg_onset_sample(marker_code) == 85
+    assert np.array_equal(epoch[:, 0], np.arange(35, 260))
+    assert ring.eeg_onset_sample(marker_code, 8) == 83
+    corrected = ring.epoch(marker_code, spec, paint_to_marker_ms=8)
+    assert np.array_equal(corrected[:, 0], np.arange(33, 258))
     assert np.allclose(np.diff(ring.recent(2)[0]), 1 / 250)
 
 
@@ -250,10 +261,49 @@ def test_ring_keeps_only_configured_device_channels(monkeypatch):
     ring = SampleRing(channels=(7, 0))
     monkeypatch.setattr("hotbrain.acquisition.time.perf_counter", lambda: 104.0)
     frame = np.tile(np.arange(8, dtype=float), (1000, 1))
-    ring.append(frame, 0)
+    frame = np.column_stack((frame, np.zeros(len(frame))))
+    frame[300, -1] = 17
+    ring.append(frame, marker_channel=8)
     spec = EpochSpec(2000)
     assert spec.end_ms == 1700 and spec.n_samples == 475
-    epoch = ring.epoch(101.0, spec)
+    epoch = ring.epoch(17, spec)
     assert epoch is not None
     assert epoch.shape == (475, 2)
     assert np.all(epoch[:, 0] == 7) and np.all(epoch[:, 1] == 0)
+
+
+def test_epoch_requires_its_own_marker_and_complete_sample_window(monkeypatch):
+    ring = SampleRing(channels=EEG.device_channels)
+    monkeypatch.setattr("hotbrain.acquisition.time.perf_counter", lambda: 100.0)
+    frame = np.column_stack((np.tile(np.arange(8, dtype=float), (100, 1)), np.zeros(100)))
+    frame[60, -1] = 41
+    ring.append(frame, marker_channel=8)
+    assert ring.epoch(42, EpochSpec()) is None
+    assert ring.epoch(41, EpochSpec()) is None
+    more = np.column_stack((np.tile(np.arange(8, dtype=float), (200, 1)), np.zeros(200)))
+    ring.append(more, marker_channel=8)
+    assert ring.epoch(41, EpochSpec()) is not None
+
+
+def test_marker_codes_do_not_reuse_old_trial_when_a_new_marker_is_pending(monkeypatch):
+    ring = SampleRing(channels=EEG.device_channels)
+    monkeypatch.setattr("hotbrain.acquisition.time.perf_counter", lambda: 100.0)
+    frame = np.zeros((260, 9))
+    frame[70, -1] = 1
+    ring.append(frame, marker_channel=8)
+    assert ring.epoch(2, EpochSpec()) is None
+    assert ring.epoch(1, EpochSpec()) is not None
+
+
+def test_fabricated_unicorn_scans_are_never_used(monkeypatch):
+    ring = SampleRing(channels=EEG.device_channels)
+    monkeypatch.setattr("hotbrain.acquisition.time.perf_counter", lambda: 100.0)
+    frame = np.zeros((300, 12))
+    frame[:, 10] = 1  # Unicorn validation flag: 1 = real scan.
+    frame[75, 11] = 23
+    frame[230, 10] = 0  # The driver filled one lost scan.
+    ring.append(frame, marker_channel=11, validation_channel=10)
+    assert ring.marker_sample(23) == 75
+    assert ring.epoch(23, EpochSpec()) is None
+    assert np.isnan(ring.recent(1)[1][180]).all()
+    assert not ring.valid_recent(.5)

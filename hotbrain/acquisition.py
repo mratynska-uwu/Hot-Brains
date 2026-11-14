@@ -1,8 +1,8 @@
-"""g.Pype Unicorn acquisition with retry and a bounded, timestamped EEG ring.
+"""g.Pype Unicorn acquisition with sample-aligned stimulus markers.
 
-The host-side timestamps are estimates from frame arrival and documented
-device/OSCAR delays. They are suitable for prototyping, not hardware-verified
-stimulus timing. A photodiode/trigger check is needed for research use.
+Classification uses markers placed on g.Pype's amplifier sample timeline,
+not host estimates of when Bluetooth frames were acquired. Physical display
+onset still needs a photodiode measurement for research-grade timing.
 """
 from __future__ import annotations
 
@@ -18,46 +18,64 @@ from .features import EpochSpec, START_MS
 
 
 class SampleRing:
-    """Keeps the configured electrodes (device_channels) of the last seconds of EEG."""
+    """Keep EEG and trial markers in the same integer sample coordinate system."""
 
-    def __init__(self, retention_s: float = 20, fs: int = 250, channels: tuple[int, ...] = tuple(range(8))):
+    def __init__(self, retention_s: float = 20, fs: int = 250, channels: tuple[int, ...] = tuple(range(8)),
+                 device_delay_ms: float = 40):
         self.fs = fs
         self.channels = list(channels)
+        # HybridBlack.DEVICE_DELAY_MS: host receipt trails acquisition. g.Pype
+        # fits to receipt stamps and explicitly does not remove device delay.
+        self.device_delay_samples = round(device_delay_ms * fs / 1000)
         self._lock = threading.Lock()
-        self._blocks: deque[tuple[np.ndarray, np.ndarray]] = deque()
-        self._latest = 0.0
+        self._blocks: deque[tuple[int, np.ndarray, np.ndarray]] = deque()
+        self._markers: dict[int, int] = {}
         self._last_arrival = 0.0
         self._received_samples = 0
-        self._end_time: float | None = None
         self.retention_s = retention_s
 
-    def append(self, frame: np.ndarray, delay_s: float):
+    def append(self, frame: np.ndarray, marker_channel: int | None = None,
+               validation_channel: int | None = None):
         raw = np.asarray(frame, dtype=np.float64)
         if raw.ndim != 2 or not len(raw) or raw.shape[1] <= max(self.channels):
             raise ValueError("Invalid EEG frame shape")
         values = raw[:, self.channels].copy()
-        if not np.isfinite(values).all():
-            raise ValueError("Non-finite EEG samples")
+        finite = np.isfinite(values).all(axis=1)
+        if marker_channel is not None:
+            if marker_channel >= raw.shape[1] or marker_channel in self.channels:
+                raise ValueError("Invalid marker channel")
+            markers = raw[:, marker_channel]
+            if not np.isfinite(markers).all():
+                raise ValueError("Non-finite trial markers")
+        else:
+            markers = np.zeros(len(raw))
+        if validation_channel is not None:
+            if validation_channel >= raw.shape[1] or validation_channel in self.channels:
+                raise ValueError("Invalid validation channel")
+            valid = (raw[:, validation_channel] == 1) & finite
+        else:
+            valid = finite
         arrival = time.perf_counter()
-        observed_end = arrival - delay_s
         with self._lock:
-            # Bluetooth frames arrive in bursts. Re-timestamping every frame
-            # from callback time creates artificial 20-70 ms gaps. Anchor the
-            # first frame, then advance by the amplifier's fixed sampling rate.
-            end = observed_end if self._end_time is None else self._end_time + len(values) / self.fs
-            times = end - np.arange(len(values) - 1, -1, -1) / self.fs
-            self._blocks.append((times, values))
-            self._latest = end
+            first = self._received_samples
+            self._blocks.append((first, values, valid.copy()))
+            for offset in np.flatnonzero(markers):
+                code = markers[offset]
+                if code > 0 and code.is_integer():
+                    self._markers[int(code)] = first + int(offset)
             self._last_arrival = arrival
             self._received_samples += len(values)
-            self._end_time = end
-            while self._blocks and self._blocks[0][0][-1] < end - self.retention_s:
+            oldest = self._received_samples - round(self.retention_s * self.fs)
+            while self._blocks and self._blocks[0][0] + len(self._blocks[0][1]) <= oldest:
                 self._blocks.popleft()
+            first_retained = self._blocks[0][0]
+            self._markers = {code: index for code, index in self._markers.items() if index >= first_retained}
 
     @property
     def latest(self) -> float:
+        """Latest frame arrival time, for the display only; never used for epochs."""
         with self._lock:
-            return self._latest
+            return self._last_arrival
 
     @property
     def last_arrival(self) -> float:
@@ -72,36 +90,71 @@ class SampleRing:
 
     def recent(self, seconds: float = 4) -> tuple[np.ndarray, np.ndarray]:
         with self._lock:
-            blocks = [(t.copy(), x.copy()) for t, x in self._blocks if t[-1] >= self._latest - seconds]
+            last = self._received_samples
+            first = max(0, last - round(seconds * self.fs))
+            blocks = [(max(i, first), x[max(0, first - i):].copy(), v[max(0, first - i):].copy())
+                      for i, x, v in self._blocks
+                      if i + len(x) > first]
+            arrival = self._last_arrival
         if not blocks:
             return np.empty(0), np.empty((0, len(self.channels)))
-        return np.concatenate([b[0] for b in blocks]), np.concatenate([b[1] for b in blocks])
+        indices = np.concatenate([np.arange(i, i + len(x)) for i, x, _ in blocks])
+        # Approximate times label the plot only. Epochs use marker sample indices.
+        times = arrival + (indices - (last - 1)) / self.fs
+        values = np.concatenate([x for _, x, _ in blocks])
+        valid = np.concatenate([v for _, _, v in blocks])
+        values[~valid] = np.nan
+        return times, values
 
-    def epoch(self, onset: float, spec: EpochSpec) -> np.ndarray | None:
-        targets = onset + (START_MS / 1000) + np.arange(spec.n_samples) / spec.fs
+    def valid_recent(self, seconds: float = .5) -> bool:
+        """Require genuine scans throughout the latest readiness window."""
+        needed = round(seconds * self.fs)
         with self._lock:
-            blocks = [(t.copy(), x.copy()) for t, x in self._blocks if t[-1] >= targets[0] - 0.1 and t[0] <= targets[-1] + 0.1]
-        if not blocks:
-            return None
-        times = np.concatenate([b[0] for b in blocks])
-        values = np.concatenate([b[1] for b in blocks])
-        order = np.argsort(times)
-        times, values = times[order], values[order]
-        keep = np.r_[True, np.diff(times) > 1e-5]
-        times, values = times[keep], values[keep]
-        if times[0] > targets[0] or times[-1] < targets[-1]:
-            return None
-        # A Bluetooth dropout cannot be safely interpolated into an epoch.
-        inside = (times >= targets[0] - .02) & (times <= targets[-1] + .02)
-        if np.diff(times[inside]).max(initial=0) > 6 / spec.fs:
-            return None
-        return np.column_stack([np.interp(targets, times, values[:, ch]) for ch in range(values.shape[1])])
+            if self._received_samples < needed:
+                return False
+            found = 0
+            for _, _, valid in reversed(self._blocks):
+                take = min(needed - found, len(valid))
+                if not valid[-take:].all():
+                    return False
+                found += take
+                if found == needed:
+                    return True
+        return False
+
+    def marker_sample(self, code: int) -> int | None:
+        with self._lock:
+            return self._markers.get(code)
+
+    def eeg_onset_sample(self, code: int, paint_to_marker_ms: float = 0) -> int | None:
+        marker = self.marker_sample(code)
+        return (None if marker is None else marker + self.device_delay_samples
+                - round(paint_to_marker_ms * self.fs / 1000))
+
+    def epoch(self, code: int, spec: EpochSpec, paint_to_marker_ms: float = 0) -> np.ndarray | None:
+        if spec.fs != self.fs:
+            raise ValueError("Epoch sample rate differs from acquisition")
+        with self._lock:
+            marker = self._markers.get(code)
+            if marker is None or not self._blocks:
+                return None
+            first = (marker + self.device_delay_samples
+                     - round(paint_to_marker_ms * self.fs / 1000)
+                     + round(START_MS * self.fs / 1000))
+            last = first + spec.n_samples
+            if first < self._blocks[0][0] or last > self._received_samples:
+                return None
+            pieces = [(x[max(0, first - i):min(len(x), last - i)].copy(),
+                       v[max(0, first - i):min(len(v), last - i)].copy())
+                      for i, x, v in self._blocks if i < last and i + len(x) > first]
+        result = np.concatenate([x for x, _ in pieces]) if pieces else np.empty((0, len(self.channels)))
+        return result if len(result) == spec.n_samples and all(v.all() for _, v in pieces) else None
 
 
 class DeviceManager(QObject):
     status_changed = Signal(str)
     connected_changed = Signal(bool)
-    _attempt_succeeded = Signal(object, object, int)
+    _attempt_succeeded = Signal(object, object, object, int)
     _attempt_failed = Signal(str, int)
 
     def __init__(self, eeg: EEGSettings, serial: str | None = None):
@@ -111,6 +164,8 @@ class DeviceManager(QObject):
         self.ring = self._new_ring()
         self.pipeline = None
         self.source = None
+        self.marker = None
+        self._next_marker = 0
         self.connected = False
         self.oscar = True
         self.serial = serial
@@ -143,11 +198,41 @@ class DeviceManager(QObject):
         self.retention_s = max(20.0, seconds)
         self.ring.retention_s = self.retention_s
 
-    def stream_ready(self, max_age_s: float = 1.0) -> bool:
+    def stream_ready(self, max_age_s: float = .25) -> bool:
         """Require a current SDK stream and enough samples for the pre-onset baseline."""
         ring = self.ring
         return (self.connected and ring.received_samples >= self.eeg.fs // 2
-                and 0 <= time.perf_counter() - ring.last_arrival <= max_age_s)
+                and 0 <= time.perf_counter() - ring.last_arrival <= max_age_s
+                and ring.valid_recent(.5)
+                and self.pipeline is not None and self.pipeline.get_condition() == "Healthy")
+
+    def readiness_issue(self) -> str:
+        if not self.connected or self.pipeline is None:
+            return "Unicorn is not connected"
+        condition = self.pipeline.get_condition()
+        if condition != "Healthy":
+            return f"g.Pype pipeline is {condition}"
+        if self.ring.received_samples < self.eeg.fs // 2:
+            return "waiting for the first half-second of EEG"
+        if time.perf_counter() - self.ring.last_arrival > .25:
+            return "EEG frames are stale"
+        if not self.ring.valid_recent(.5):
+            return "lost or invalid Unicorn scans in the last 0.5 s"
+        return "ready"
+
+    def mark_image(self, paint_stamp: float) -> tuple[int, float]:
+        """Put this image onset on the amplifier's sample grid via g.Pype."""
+        if not self.stream_ready() or self.marker is None:
+            raise RuntimeError("EEG timing stream is not ready")
+        if time.perf_counter() - paint_stamp > .020:
+            raise RuntimeError("image paint-to-marker delay exceeded 20 ms")
+        self._next_marker += 1
+        emission_age_ms = (time.perf_counter() - paint_stamp) * 1000
+        self.marker.emit(self._next_marker)
+        completion_age_ms = (time.perf_counter() - paint_stamp) * 1000
+        if completion_age_ms > 20:
+            raise RuntimeError(f"image paint-to-marker delay was {completion_age_ms:.1f} ms")
+        return self._next_marker, emission_age_ms
 
     def _tick(self):
         now = time.perf_counter()
@@ -173,8 +258,12 @@ class DeviceManager(QObject):
             import gpype as gp
 
             manager = self
+            # The Unicorn driver can fill missing scans. Its validation flag
+            # (column 10 here) is essential for rejecting those samples.
             source = gp.HybridBlack(serial=serial, enable_oscar=oscar, include_accel=False,
-                                    include_gyro=False, include_aux=False, frame_size=4)
+                                    include_gyro=False, include_aux=True, frame_size=4)
+            marker = gp.Marker()
+            router = gp.Router(input_channels=[gp.Router.ALL, gp.Router.ALL])
 
             class RingSink(gp.Sink):
                 def __init__(self):
@@ -184,18 +273,19 @@ class DeviceManager(QObject):
                     frame = data.get("in")
                     ring = manager.ring
                     if generation == manager._generation and frame is not None and len(frame):
-                        oscar_samples = source.oscar_delay_samples or 0
-                        try:
-                            ring.append(frame, .040 + oscar_samples / manager.eeg.fs)
-                        except ValueError:
-                            # Invalid SDK frames do not count as a live stream.
-                            pass
+                        # Router appends the aligned marker channel after the
+                        # eight EEG and three auxiliary channels.
+                        if frame.shape[1] != 12:
+                            raise ValueError("Expected 8 EEG, 3 auxiliary, and 1 marker channel")
+                        ring.append(frame, marker_channel=11, validation_channel=10)
                     return {}
 
             pipeline = gp.Pipeline()
-            pipeline.connect(source, RingSink())
+            pipeline.connect(source, router["in1"])
+            pipeline.connect(marker, router["in2"])
+            pipeline.connect(router, RingSink())
             pipeline.start()
-            self._attempt_succeeded.emit(pipeline, source, generation)
+            self._attempt_succeeded.emit(pipeline, source, marker, generation)
         except Exception as exc:
             if pipeline is not None:
                 try:
@@ -205,7 +295,7 @@ class DeviceManager(QObject):
                     pass
             self._attempt_failed.emit(f"{type(exc).__name__}: {exc}", generation)
 
-    def _connected(self, pipeline, source, generation: int):
+    def _connected(self, pipeline, source, marker, generation: int):
         if generation != self._generation:
             try:
                 pipeline.stop()
@@ -216,6 +306,7 @@ class DeviceManager(QObject):
         self._attempting = False
         self.pipeline = pipeline
         self.source = source
+        self.marker = marker
         self.connected = True
         self._connected_at = time.perf_counter()
         self.connected_changed.emit(True)
@@ -246,6 +337,7 @@ class DeviceManager(QObject):
                 pass
         self.pipeline = None
         self.source = None
+        self.marker = None
         self.ring = self._new_ring()
         if was_connected:
             self.connected_changed.emit(False)

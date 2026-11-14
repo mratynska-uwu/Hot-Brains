@@ -30,13 +30,14 @@ class NoDevice(QObject):
         self.oscar = True
         self.serial = serial
         self.ring = SampleRing(fs=eeg.fs, channels=eeg.device_channels)
+        self._marker_code = 0
 
     def provide_test_frames(self):
         # Isolated unit-test fixture; the application never synthesizes EEG.
         samples = 500
         t = np.arange(samples) / self.eeg.fs
         frame = np.column_stack([20 * np.sin(2 * np.pi * (8 + i) * t) for i in range(8)])
-        self.ring.append(frame, 0)
+        self.ring.append(frame)
         was_connected = self.connected
         self.connected = True
         if not was_connected:
@@ -45,6 +46,10 @@ class NoDevice(QObject):
     def stream_ready(self, max_age_s=1.0):
         return (self.connected and self.ring.received_samples >= self.eeg.fs // 2
                 and time.perf_counter() - self.ring.last_arrival <= max_age_s)
+
+    def mark_image(self, paint_stamp):
+        self._marker_code += 1
+        return self._marker_code, 0.0
 
     def configure(self, oscar, serial):
         self.oscar = oscar

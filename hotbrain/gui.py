@@ -537,6 +537,8 @@ class PendingEpoch:
     image: StimulusImage
     onset: float
     deadline: float
+    marker_code: int
+    paint_to_marker_ms: float
 
 
 class MainWindow(QMainWindow):
@@ -755,13 +757,15 @@ class MainWindow(QMainWindow):
                              "fixation_min_s": fixation_min, "fixation_max_s": fixation_max,
                              "epoch_start_ms": START_MS, "epoch_end_ms": self.epoch_spec.end_ms,
                              "epoch_sample_count": self.epoch_spec.n_samples,
+                             "unicorn_device_delay_ms": 40,
+                             "device_delay_samples": self.device.ring.device_delay_samples,
                              "fs": eeg.fs, "channels": eeg.electrodes, "device_channels": eeg.device_channels,
                              "feature_names": self.extractor.names, "classifiers": classifier_keys,
                              "config": self.config.raw,
                              "oscar_settling_requested_seconds": self.training.warmup_seconds.value() if self.training.warmup.isChecked() else 0,
                              "oscar_settling_applied_seconds": 0,
                              "dataset": self.dataset.manifest(),
-                             "timing_note": f"Image onset uses Qt paint completion; EEG times anchor to first host frame arrival minus device/OSCAR delay then advance at {eeg.fs} Hz. Validate with hardware trigger."}
+                             "timing_note": "g.Pype places trial markers on the Unicorn sample grid; epoch indices add the documented 40 ms device acquisition-to-host delay. OSCAR delay is handled by the pipeline. The Qt paint callback estimates visible onset; verify screen latency with a photodiode."}
         if self.training.oscar.isChecked() and self.training.warmup.isChecked():
             seconds = self.training.warmup_seconds.value()
             self.run_metadata["oscar_settling_applied_seconds"] = seconds
@@ -791,13 +795,21 @@ class MainWindow(QMainWindow):
     def on_image_onset(self, stamp: float):
         if not self.active or not self.ensure_eeg_stream() or self.next_trial is None:
             return
+        try:
+            marker_code, marker_delay_ms = self.device.mark_image(stamp)
+        except Exception as exc:
+            self.stop_run(f"Could not place image marker: {exc}.")
+            return
         item = self.next_trial
         self.shown += 1
-        self.pending.append(PendingEpoch(self.shown, item, stamp, stamp + self.epoch_spec.end_ms / 1000 + 2.0))
+        self.pending.append(PendingEpoch(self.shown, item, stamp, stamp + self.epoch_spec.end_ms / 1000 + 2.0,
+                                         marker_code, marker_delay_ms))
         self.trial_log.append({"number": self.shown, "group": item.group, "image": item.path.name,
                                "labels": {t: self.dataset.class_name(t, v) for t, v in item.labels.items()},
                                "target_values": dict(item.values),
                                "onset_s_from_run_start": round(stamp - self.run_start_clock, 6),
+                               "marker_code": marker_code,
+                               "paint_to_marker_ms": round(marker_delay_ms, 3),
                                "eeg": "pending"})
         self.training.status.setText(f"Image {self.shown}: {item.group}/{item.path.name}")
         self._update_counts()
@@ -814,7 +826,7 @@ class MainWindow(QMainWindow):
         now = time.perf_counter()
         stream_ready = self.device.stream_ready()
         if self.active and not stream_ready:
-            self.stop_run("EEG stream stopped; training stopped.")
+            self.stop_run("EEG stream stopped or timing became unreliable; training stopped.")
         self.update_start_availability()
         if stream_ready:
             device_text = (f"Unicorn {self.device.serial or '(first available)'} streaming EEG · OSCAR "
@@ -824,7 +836,8 @@ class MainWindow(QMainWindow):
             if self.ready_for_new_run and self.training.status.text().startswith("Waiting for"):
                 self.training.status.setText("EEG stream ready. Start training.")
         elif self.device.connected:
-            self.training.device_status.setText("Unicorn opened, but no current EEG samples. Training disabled.")
+            issue = self.device.readiness_issue() if hasattr(self.device, "readiness_issue") else "EEG timing unavailable"
+            self.training.device_status.setText(f"Unicorn opened, but {issue}. Training disabled.")
         if not stream_ready:
             if self.features.samples or any(rating.good is not None for rating in self.features.quality_map.ratings):
                 self.features.clear()
@@ -847,10 +860,24 @@ class MainWindow(QMainWindow):
                     self.last_feature_time = now
                 except ValueError:
                     pass
+        if self.finishing and not stream_ready and self.pending:
+            for item in self.pending:
+                log = self.trial_log[item.number - 1]
+                log["marker_sample_index"] = self.device.ring.marker_sample(item.marker_code)
+                log["eeg_onset_sample_index"] = self.device.ring.eeg_onset_sample(
+                    item.marker_code, item.paint_to_marker_ms)
+                log["eeg"] = "timing_unreliable"
+                self.skipped += 1
+            self.pending.clear()
+            self._update_counts()
         for item in self.pending[:]:
-            epoch = self.device.ring.epoch(item.onset, self.epoch_spec) if self.device.connected else None
+            epoch = (self.device.ring.epoch(item.marker_code, self.epoch_spec, item.paint_to_marker_ms)
+                     if self.device.connected else None)
             if epoch is not None:
                 log = self.trial_log[item.number - 1]
+                log["marker_sample_index"] = self.device.ring.marker_sample(item.marker_code)
+                log["eeg_onset_sample_index"] = self.device.ring.eeg_onset_sample(
+                    item.marker_code, item.paint_to_marker_ms)
                 try:
                     vector = self.extractor.extract(epoch, self.epoch_spec)
                     # Guard gross artifacts/flatlines without pretending OSCAR has fixed them.
@@ -880,7 +907,11 @@ class MainWindow(QMainWindow):
                 self._update_counts()
             elif now >= item.deadline:
                 self.skipped += 1
-                self.trial_log[item.number - 1]["eeg"] = "missing_or_incomplete"
+                log = self.trial_log[item.number - 1]
+                log["marker_sample_index"] = self.device.ring.marker_sample(item.marker_code)
+                log["eeg_onset_sample_index"] = self.device.ring.eeg_onset_sample(
+                    item.marker_code, item.paint_to_marker_ms)
+                log["eeg"] = "missing_marker_or_incomplete_epoch"
                 self.pending.remove(item)
                 self._update_counts()
             else:
