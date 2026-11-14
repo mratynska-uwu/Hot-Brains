@@ -9,11 +9,11 @@ from pathlib import Path
 
 import numpy as np
 import pyqtgraph as pg
-from PySide6.QtCore import QPointF, QRectF, Qt, QTimer, Signal
+from PySide6.QtCore import QPointF, QRect, QRectF, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QFont, QImageReader, QKeySequence, QLinearGradient, QPainter, QPainterPath, QPen, QPixmap, QShortcut
 from PySide6.QtWidgets import (
-    QApplication, QCheckBox, QComboBox, QDoubleSpinBox, QFormLayout, QGridLayout, QHBoxLayout, QLabel,
-    QLineEdit, QMainWindow, QMessageBox, QPushButton, QSpinBox, QTabWidget, QVBoxLayout,
+    QApplication, QCheckBox, QComboBox, QDoubleSpinBox, QFormLayout, QFrame, QGridLayout, QHBoxLayout, QLabel,
+    QLineEdit, QMainWindow, QMessageBox, QPushButton, QScrollArea, QSpinBox, QVBoxLayout,
     QWidget, QTableWidget, QTableWidgetItem, QToolTip,
 )
 
@@ -33,7 +33,7 @@ class Stimulus(QWidget):
 
     def __init__(self):
         super().__init__()
-        self.setMinimumSize(520, 380)
+        self.setMinimumSize(320, 260)
         self.state = "idle"
         self.pixmap = QPixmap()
         self._emit_on_paint = False
@@ -90,6 +90,7 @@ class PresentationPanel(QWidget):
         layout.addWidget(self.stimulus, 1)
         self.note = QLabel()
         self.note.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.note.setWordWrap(True)
         layout.addWidget(self.note)
         self.set_timing(2.0, 3.0, EpochSpec(image_duration_ms=4500))
 
@@ -191,7 +192,12 @@ class TrainingPanel(QWidget):
                              "before that trial is added to its fit. OSCAR adapts online; g.Pype does not expose a saved calibration state.")
         self.detail.setWordWrap(True)
         settings_layout.addWidget(self.detail)
-        layout.addWidget(self.settings_widget)
+        self.settings_scroll = QScrollArea()
+        self.settings_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.settings_scroll.setWidgetResizable(True)
+        self.settings_scroll.setMaximumHeight(420)
+        self.settings_scroll.setWidget(self.settings_widget)
+        layout.addWidget(self.settings_scroll)
         buttons = QHBoxLayout()
         self.start = QPushButton("Start training")
         self.stop = QPushButton("Stop training")
@@ -220,11 +226,10 @@ class TrainingPanel(QWidget):
         self.count_status = QLabel("Trials: 0 · usable EEG: 0")
         layout.addWidget(self.count_status)
         self.accuracy = QTableWidget(0, 6)
-        self.accuracy.setHorizontalHeaderLabels(("Target (class 1)", "Classifier", f"Last {ROLLING} held-out correct", "Predictions", "Latest P(class 1)", "Save"))
+        self.accuracy.setHorizontalHeaderLabels(("Target (+)", "Model", f"Last {ROLLING} correct", "N", "P(+)", "Save"))
         self.accuracy.horizontalHeader().setStretchLastSection(True)
-        self.accuracy.setColumnWidth(1, 220)
-        self.accuracy.setColumnWidth(2, 200)
-        self.accuracy.setColumnWidth(4, 130)
+        for column, width in enumerate((100, 130, 125, 45, 75, 50)):
+            self.accuracy.setColumnWidth(column, width)
         self.accuracy.setMaximumHeight(240)
         layout.addWidget(self.accuracy)
         self.plot = pg.PlotWidget()
@@ -280,7 +285,9 @@ class TrainingPanel(QWidget):
         for row, (target, clf) in enumerate(model_keys):
             label = classifiers.CLASSIFIERS[clf].label
             for col, text in enumerate((f"{target} ({self.class1_names[target]})", label, "—", "0", "—")):
-                self.accuracy.setItem(row, col, QTableWidgetItem(text))
+                item = QTableWidgetItem(text)
+                item.setToolTip(text)
+                self.accuracy.setItem(row, col, item)
             save_box = QCheckBox()
             save_box.setToolTip(f"Save fitted {target} / {label} model")
             save_box.setEnabled(False)
@@ -504,17 +511,16 @@ class FeaturePanel(QWidget):
         self.current.setText(f"Current value: {self.samples[-1][1][index]:.3f}")
 
 
-class DetachedWindow(QMainWindow):
-    def __init__(self, title: str, panel: QWidget, on_close):
+class PanelWindow(QMainWindow):
+    def __init__(self, title: str, panel: QWidget, on_close=None):
         super().__init__()
         self.setWindowTitle(title)
         self.setCentralWidget(panel)
-        self.resize(900, 650)
         self._on_close = on_close
 
     def closeEvent(self, event):
-        panel = self.takeCentralWidget()
-        self._on_close(panel)
+        if self._on_close is not None:
+            self._on_close()
         event.accept()
 
 
@@ -535,7 +541,7 @@ class MainWindow(QMainWindow):
         self.quality = SignalQuality(self.config.eeg)
         self.idle_spec = self.extractor.epoch_spec(max(1000, self.extractor.min_image_duration_ms))
         self.setWindowTitle("Hot Brain · scene training")
-        self.resize(1200, 950)
+        self.resize(720, 900)
         self.training = TrainingPanel(self.config, self.extractor.min_image_duration_ms / 1000)
         self.device = DeviceManager(self.config.eeg, self.training.serial.text().strip() or None)
         self.presentation = PresentationPanel()
@@ -544,13 +550,10 @@ class MainWindow(QMainWindow):
             control.valueChanged.connect(self.update_timing_note)
         self.update_timing_note()
         self.features = FeaturePanel(self.extractor.names, self.extractor.channels)
-        self.panels = [self.training, self.presentation, self.features]
-        self.titles = ["Training progress", "Image presentation", "EEG features"]
-        self.detached: dict[int, DetachedWindow] = {}
-        self.tabs = QTabWidget()
-        self.setCentralWidget(self.tabs)
-        for index, panel in enumerate(self.panels):
-            self._insert_tab(index, panel)
+        self.setCentralWidget(self.training)
+        self.presentation_window = PanelWindow("Hot Brain · image presentation", self.presentation,
+                                                self.stop_run)
+        self.features_window = PanelWindow("Hot Brain · EEG features", self.features)
         self.training.start_requested.connect(self.start_run)
         self.training.stop_requested.connect(self.stop_run)
         self.stop_shortcut = QShortcut(QKeySequence(self.training.stop_key.currentText()), self)
@@ -614,36 +617,25 @@ class MainWindow(QMainWindow):
         spec = self.extractor.epoch_spec(round(self.training.image_seconds.value() * 1000))
         self.presentation.set_timing(self.training.fixation_min.value(), self.training.fixation_max.value(), spec)
 
-    def _insert_tab(self, index: int, panel: QWidget):
-        wrapper = QWidget()
-        box = QVBoxLayout(wrapper)
-        row = QHBoxLayout()
-        row.addStretch()
-        detach = QPushButton("Open in window ↗")
-        detach.clicked.connect(lambda _=False, i=index: self.detach(i))
-        row.addWidget(detach)
-        box.addLayout(row)
-        box.addWidget(panel, 1)
-        self.tabs.insertTab(index, wrapper, self.titles[index])
-
-    def detach(self, index: int):
-        if index in self.detached:
-            self.detached[index].raise_(); return
-        wrapper = self.panels[index].parentWidget()
-        tab_index = self.tabs.indexOf(wrapper)
-        if tab_index < 0:
-            return
-        self.tabs.removeTab(tab_index)
-        self.panels[index].setParent(None)
-        window = DetachedWindow(self.titles[index], self.panels[index], lambda panel, i=index: self.reattach(i, panel))
-        self.detached[index] = window
-        window.show()
-
-    def reattach(self, index: int, panel: QWidget):
-        self.detached.pop(index, None)
-        self._insert_tab(min(index, self.tabs.count()), panel)
-        if index == 1 and self.active:
-            self.tabs.setCurrentWidget(panel.parentWidget())
+    def show_windows(self, available: QRect | None = None):
+        """Open all three movable windows in adjacent slices of one screen."""
+        if available is None:
+            screen = QApplication.primaryScreen()
+            available = screen.availableGeometry() if screen is not None else QRect(0, 0, 1600, 900)
+        area = available.adjusted(8, 8, -8, -8)
+        gap = 10
+        width = area.width() - 2 * gap
+        training_width = round(width * .40)
+        presentation_width = round(width * .32)
+        feature_width = width - training_width - presentation_width
+        self.setGeometry(area.x(), area.y(), training_width, area.height())
+        self.presentation_window.setGeometry(area.x() + training_width + gap, area.y(),
+                                             presentation_width, area.height())
+        self.features_window.setGeometry(area.x() + training_width + gap + presentation_width + gap,
+                                         area.y(), feature_width, area.height())
+        self.show()
+        self.presentation_window.show()
+        self.features_window.show()
 
     def on_connection(self, connected: bool):
         eeg = self.config.eeg
@@ -688,7 +680,7 @@ class MainWindow(QMainWindow):
         self.shown = self.usable = self.skipped = 0
         self.training.start.setEnabled(False)
         self.training.stop.setEnabled(True)
-        self.training.settings_widget.setVisible(False)
+        self.training.settings_scroll.setVisible(False)
         self.stop_shortcut.setEnabled(True)
         self.training.save.setEnabled(False)
         self.training.discard.setEnabled(False)
@@ -704,10 +696,9 @@ class MainWindow(QMainWindow):
         self.epoch_groups = []
         self.run_start_clock = time.perf_counter()
         self._update_counts()
-        # A hidden tab does not paint, so give the participant a visible window.
-        if 1 not in self.detached:
-            self.detach(1)
-        self.detached[1].raise_()
+        # A visible presentation window is required for paint-timed onsets.
+        if not self.presentation_window.isVisible():
+            self.presentation_window.show()
         eeg = self.config.eeg
         self.run_metadata = {"started_at": datetime.now().astimezone().isoformat(),
                              "participant_id": self.training.participant.text().strip() or "unnamed",
@@ -889,7 +880,7 @@ class MainWindow(QMainWindow):
         self.training.status.setText(f"Saved {len(written) + 1} files to saved_models/{stem.name}.*")
         self.training.reset_save_selection()
         self.training.start.setEnabled(True)
-        self.training.settings_widget.setVisible(True)
+        self.training.settings_scroll.setVisible(True)
         self.training.discard.setEnabled(False)
         self._enable_settings()
 
@@ -902,7 +893,7 @@ class MainWindow(QMainWindow):
         self.epoch_groups = []
         self.training.status.setText("Run discarded. Ready to start again.")
         self.training.start.setEnabled(True)
-        self.training.settings_widget.setVisible(True)
+        self.training.settings_scroll.setVisible(True)
         self.training.reset_save_selection()
         self.training.discard.setEnabled(False)
         self._enable_settings()
@@ -916,8 +907,8 @@ class MainWindow(QMainWindow):
         self.active = False
         self.clock.stop()
         self.device.close()
-        for window in list(self.detached.values()):
-            window.close()
+        self.presentation_window.close()
+        self.features_window.close()
         event.accept()
 
 
@@ -926,5 +917,5 @@ def launch(root: Path, config: dict | None = None):
     app = QApplication.instance() or QApplication([])
     pg.setConfigOptions(antialias=True)
     window = MainWindow(root, config)
-    window.show()
+    window.show_windows()
     return app.exec()

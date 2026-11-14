@@ -47,11 +47,11 @@ Defaults:
 3. Check any combination of models under **Train models**. Logistic regression, RBF SVM and shallow random forest are checked by default; linear SVM is also available. Each selected model gets its own accuracy curve and row for each target.
 4. Set image duration (default 4.5 s) and fixation minimum/maximum (default 2–3 s, drawn uniformly). Choose OSCAR and optional pretrial settling.
 5. Wait until the device status says connected, then start. Trials shown during connection setup have no complete EEG epoch.
-6. The image tab opens in an independent window; maximize it on the participant display. The other two tabs can also detach.
+6. At launch, training progress, image presentation, and EEG features open by default as three separate, draggable windows arranged side by side. Move or maximize any window independently, including the image window on the participant display.
 7. Stop with the button or the selected stop key (Escape by default), or let a finite run end.
 8. After stopping, use the **Save** checkbox in each fitted target/model row to choose exactly which models to keep; all fitted models are initially checked. Then click **Save fitted models**, or discard the run. A model needs at least ten usable epochs with both labels to be fitted. With no EEG, the trial sequence still runs and no model or accuracy is fabricated.
 
-During a run, the training settings collapse to leave room for the live plot. The training tab shows a table and simultaneous curves with the rolling accuracy of the last 20 **test-before-train** predictions for every target/classifier pair. The table also shows the latest P(class 1) (positive valence or high arousal), save checkboxes after stopping, and standardized weights for linear models.
+During a run, the training settings collapse to leave room for the live plot. The training window shows a table and simultaneous curves with the rolling accuracy of the last 20 **test-before-train** predictions for every target/classifier pair. The table also shows the latest P(class 1) (positive valence or high arousal), save checkboxes after stopping, and standardized weights for linear models.
 
 ## EEG epochs and features
 

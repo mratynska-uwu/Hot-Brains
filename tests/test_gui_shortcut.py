@@ -1,4 +1,4 @@
-"""The stop shortcut must work from a detached participant window."""
+"""The three startup windows remain independent and share the stop shortcut."""
 
 import copy
 import os
@@ -7,7 +7,7 @@ from pathlib import Path
 import numpy as np
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import QObject, Qt, Signal
+from PySide6.QtCore import QObject, QRect, Qt, Signal
 from PySide6.QtGui import QImage
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication
@@ -36,7 +36,7 @@ class NoDevice(QObject):
         pass
 
 
-def test_chosen_key_stops_from_detached_presentation(tmp_path: Path, monkeypatch):
+def test_chosen_key_stops_from_presentation_window(tmp_path: Path, monkeypatch):
     monkeypatch.setattr(gui, "DeviceManager", NoDevice)
     for folder_name, positive, aroused in (("set/happy", 1, (1.0, 3.0)), ("set/sad", 0, (2.0, 4.0))):
         folder = tmp_path / "data" / folder_name
@@ -51,9 +51,22 @@ def test_chosen_key_stops_from_detached_presentation(tmp_path: Path, monkeypatch
 
     app = QApplication.instance() or QApplication([])
     window = gui.MainWindow(tmp_path, config)
-    window.show()
+    window.show_windows(QRect(0, 0, 1800, 1000))
     window.training.warmup.setChecked(False)
     try:
+        app.processEvents()
+        assert window.isVisible()
+        assert window.presentation_window.isVisible()
+        assert window.features_window.isVisible()
+        assert window.geometry().right() < window.presentation_window.geometry().left()
+        assert window.presentation_window.geometry().right() < window.features_window.geometry().left()
+        assert window.training.parentWidget() is window
+        assert window.presentation.parentWidget() is window.presentation_window
+        assert window.features.parentWidget() is window.features_window
+        window.show_windows(QRect(0, 0, 1440, 900))
+        app.processEvents()
+        assert window.geometry().right() < window.presentation_window.geometry().left()
+        assert window.presentation_window.geometry().right() < window.features_window.geometry().left()
         assert window.dataset is not None, window.training.dataset_status.text()
         assert window.training.image_seconds.value() == 4.5
         assert window.training.fixation_min.value() == 2.0
@@ -78,14 +91,14 @@ def test_chosen_key_stops_from_detached_presentation(tmp_path: Path, monkeypatch
             window.start_run()
             app.processEvents()
             assert window.active
-            assert window.training.settings_widget.isHidden()
+            assert window.training.settings_scroll.isHidden()
             assert window.training.accuracy.columnCount() == 6
             assert window.training.accuracy.rowCount() == (2 if key_name == "Escape" else 6)
             assert window.run_metadata["classifiers"] == (["svm"] if key_name == "Escape" else ["logreg", "svm", "forest"])
             assert window.run_metadata["epoch_end_ms"] == 1700
             assert window.run_metadata["fixation_min_s"] == 2.0
             assert window.run_metadata["fixation_max_s"] == 4.0
-            presentation = window.detached[1]
+            presentation = window.presentation_window
             presentation.activateWindow()
             presentation.setFocus()
             app.processEvents()
@@ -95,7 +108,7 @@ def test_chosen_key_stops_from_detached_presentation(tmp_path: Path, monkeypatch
             assert not window.stop_shortcut.isEnabled()
             assert not window.training.save.isEnabled()
             window.discard_run()
-            assert not window.training.settings_widget.isHidden()
+            assert not window.training.settings_scroll.isHidden()
         trainer = MultiTrainer(["valence", "arousal"], ["logreg", "svm", "forest"],
                                len(window.extractor.names))
         for number in range(16):
