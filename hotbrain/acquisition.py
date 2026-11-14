@@ -122,6 +122,20 @@ class SampleRing:
                     return True
         return False
 
+    def any_valid_recent(self, seconds: float = 1.0) -> bool:
+        """Distinguish a continuing real EEG stream from filled-in scans only."""
+        needed = round(seconds * self.fs)
+        with self._lock:
+            found = 0
+            for _, _, valid in reversed(self._blocks):
+                take = min(needed - found, len(valid))
+                if valid[-take:].any():
+                    return True
+                found += take
+                if found >= needed:
+                    break
+        return False
+
     def marker_sample(self, code: int) -> int | None:
         with self._lock:
             return self._markers.get(code)
@@ -132,23 +146,34 @@ class SampleRing:
                 - round(paint_to_marker_ms * self.fs / 1000))
 
     def epoch(self, code: int, spec: EpochSpec, paint_to_marker_ms: float = 0) -> np.ndarray | None:
+        return self.epoch_result(code, spec, paint_to_marker_ms)[0]
+
+    def epoch_result(self, code: int, spec: EpochSpec,
+                     paint_to_marker_ms: float = 0) -> tuple[np.ndarray | None, str]:
+        """Return a completed epoch or why it cannot yet be used."""
         if spec.fs != self.fs:
             raise ValueError("Epoch sample rate differs from acquisition")
         with self._lock:
             marker = self._markers.get(code)
             if marker is None or not self._blocks:
-                return None
+                return None, "waiting_marker"
             first = (marker + self.device_delay_samples
                      - round(paint_to_marker_ms * self.fs / 1000)
                      + round(START_MS * self.fs / 1000))
             last = first + spec.n_samples
-            if first < self._blocks[0][0] or last > self._received_samples:
-                return None
+            if first < self._blocks[0][0]:
+                return None, "expired_epoch"
+            if last > self._received_samples:
+                return None, "waiting_samples"
             pieces = [(x[max(0, first - i):min(len(x), last - i)].copy(),
                        v[max(0, first - i):min(len(v), last - i)].copy())
                       for i, x, v in self._blocks if i < last and i + len(x) > first]
         result = np.concatenate([x for x, _ in pieces]) if pieces else np.empty((0, len(self.channels)))
-        return result if len(result) == spec.n_samples and all(v.all() for _, v in pieces) else None
+        if len(result) != spec.n_samples:
+            return None, "incomplete_epoch"
+        if not all(v.all() for _, v in pieces):
+            return None, "invalid_scans"
+        return result, "ready"
 
 
 class DeviceManager(QObject):
@@ -201,10 +226,16 @@ class DeviceManager(QObject):
     def stream_ready(self, max_age_s: float = .25) -> bool:
         """Require a current SDK stream and enough samples for the pre-onset baseline."""
         ring = self.ring
+        return self.stream_live(max_age_s) and ring.valid_recent(.5)
+
+    def stream_live(self, max_age_s: float = .5) -> bool:
+        """Keep trials running through isolated bad scans, but not a real stream loss."""
+        ring = self.ring
         return (self.connected and ring.received_samples >= self.eeg.fs // 2
                 and 0 <= time.perf_counter() - ring.last_arrival <= max_age_s
-                and ring.valid_recent(.5)
-                and self.pipeline is not None and self.pipeline.get_condition() == "Healthy")
+                and ring.any_valid_recent(1.0)
+                and self.pipeline is not None
+                and self.pipeline.get_condition() in ("Healthy", "Warning"))
 
     def readiness_issue(self) -> str:
         if not self.connected or self.pipeline is None:
@@ -216,13 +247,15 @@ class DeviceManager(QObject):
             return "waiting for the first half-second of EEG"
         if time.perf_counter() - self.ring.last_arrival > .25:
             return "EEG frames are stale"
+        if not self.ring.any_valid_recent(1.0):
+            return "no real Unicorn scans in the last second"
         if not self.ring.valid_recent(.5):
-            return "lost or invalid Unicorn scans in the last 0.5 s"
+            return "waiting for 0.5 s of clean EEG before starting"
         return "ready"
 
     def mark_image(self, paint_stamp: float) -> tuple[int, float]:
         """Put this image onset on the amplifier's sample grid via g.Pype."""
-        if not self.stream_ready() or self.marker is None:
+        if not self.stream_live() or self.marker is None:
             raise RuntimeError("EEG timing stream is not ready")
         if time.perf_counter() - paint_stamp > .020:
             raise RuntimeError("image paint-to-marker delay exceeded 20 ms")

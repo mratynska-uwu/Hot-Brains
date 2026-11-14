@@ -6,7 +6,7 @@ up front so a typo fails at startup rather than mid-session.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -42,7 +42,8 @@ CONFIG: dict[str, Any] = {
     },
     "eeg": {
         "sampling_rate": 250,
-        "electrodes": ["Fz", "C3", "Cz", "C4", "P3", "Pz", "P4", "Oz"],
+        # Confirmed physical Unicorn Hybrid Black cap: clips 1-8 in this order.
+        "electrodes": ["Fz", "C3", "Cz", "C4", "Pz", "PO7", "Oz", "PO8"],
         # Unicorn EEG channel (0-7) wired to each electrode above, in order.
         # None = the first len(electrodes) channels in order.
         "device_channels": None,
@@ -59,9 +60,9 @@ CONFIG: dict[str, Any] = {
         "fractal_kmax": 10,
         # Regions used by "region_band_power" and "erp".
         "regions": {"frontal": ["Fz"], "central": ["C3", "Cz", "C4"],
-                    "parietal": ["P3", "Pz", "P4"], "occipital": ["Oz"]},
+                    "parietal": ["Pz"], "posterior": ["PO7", "Oz", "PO8"]},
         # (right, left) pairs used by "asymmetry".
-        "asymmetry_pairs": [["C4", "C3"], ["P4", "P3"]],
+        "asymmetry_pairs": [["C4", "C3"], ["PO8", "PO7"]],
         # Windows after image onset used by "erp"; None = end of the epoch.
         "erp_windows_ms": [[100, 200], [200, 350], [350, None]],
     },
@@ -80,7 +81,7 @@ CONFIG: dict[str, Any] = {
         "arousal": {"column": "arousal", "threshold": "median", "classes": ["low", "high"]},
     },
     # Keys from hotbrain.classifiers.CLASSIFIERS selected by default in the GUI.
-    "classifiers": ["logreg", "svm", "forest"],
+    "classifiers": ["logreg"],
 }
 
 
@@ -100,6 +101,24 @@ class EEGSettings:
 
     UNICORN_CHANNELS = 8
     FEATURE_FAMILIES = ("band_power", "fractal_dimension", "region_band_power", "asymmetry", "erp")
+
+    def select_electrodes(self, positions: tuple[int, ...]) -> "EEGSettings":
+        """Build model settings for a subset while preserving physical channel order."""
+        if not positions or len(set(positions)) != len(positions) or any(
+                index < 0 or index >= len(self.electrodes) for index in positions):
+            raise ValueError("Select at least one distinct configured electrode")
+        positions = tuple(sorted(positions))
+        electrodes = tuple(self.electrodes[index] for index in positions)
+        selected = set(electrodes)
+        regions = tuple((name, tuple(member for member in members if member in selected))
+                        for name, members in self.regions)
+        regions = tuple((name, members) for name, members in regions if members)
+        pairs = tuple((right, left) for right, left in self.asymmetry_pairs
+                      if right in selected and left in selected)
+        features = tuple(family for family in self.features if family != "asymmetry" or pairs)
+        return replace(self, electrodes=electrodes,
+                       device_channels=tuple(self.device_channels[index] for index in positions),
+                       regions=regions, asymmetry_pairs=pairs, features=features)
 
     @classmethod
     def from_dict(cls, d: dict) -> "EEGSettings":
@@ -256,6 +275,8 @@ class AppConfig:
         unknown = [c for c in classifiers if c not in CLASSIFIERS]
         if unknown:
             raise ValueError(f"Unknown classifiers {unknown}; available: {sorted(CLASSIFIERS)}")
+        if len(classifiers) != len(set(classifiers)) or len(classifiers) > 3:
+            raise ValueError("Select at most three distinct default classifiers")
         split = d.get("split", {})
         fraction = float(split.get("validation_fraction", 0.2))
         if not 0 <= fraction < 1:

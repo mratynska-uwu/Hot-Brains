@@ -47,6 +47,9 @@ class NoDevice(QObject):
         return (self.connected and self.ring.received_samples >= self.eeg.fs // 2
                 and time.perf_counter() - self.ring.last_arrival <= max_age_s)
 
+    def stream_live(self, max_age_s=1.0):
+        return self.stream_ready(max_age_s)
+
     def mark_image(self, paint_stamp):
         self._marker_code += 1
         return self._marker_code, 0.0
@@ -94,24 +97,51 @@ def test_chosen_key_stops_from_presentation_window(tmp_path: Path, monkeypatch):
         assert window.geometry().right() < window.presentation_window.geometry().left()
         assert window.presentation_window.geometry().right() < window.features_window.geometry().left()
         assert window.dataset is not None, window.training.dataset_status.text()
+        assert window.training.evaluation.currentData() == gui.EVAL_SPLIT
+        assert not window.training.evaluation.model().item(0).isEnabled()
+        window.training.count.setValue(4)
+        assert window.training.evaluation.model().item(0).isEnabled()
+        window.training.evaluation.setCurrentIndex(0)
+        assert window.training.evaluation.currentData() == gui.EVAL_PREQUENTIAL
+        window.training.persistent.setChecked(True)
+        assert window.training.evaluation.currentData() == gui.EVAL_SPLIT
+        assert not window.training.evaluation.model().item(0).isEnabled()
+        window.training.persistent.setChecked(False)
+        window.training.count.setValue(160)
         assert not window.training.start.isEnabled()
+        assert window.features.raw_sample_count == 0
+        assert all("Waiting" in label.text() for label in window.features.quality_labels)
         window.start_run()
         assert not window.active
         assert window.shown == 0
         assert window.presentation.stimulus.state == "idle"
         assert not window.features.samples
-        assert window.training.image_seconds.value() == 4.5
+        assert window.training.image_seconds.value() == 3.0
+        assert all(timer.timerType() == Qt.TimerType.PreciseTimer for timer in
+                   (window.warmup_timer, window.fixation_timer, window.image_timer))
         assert window.training.fixation_min.value() == 2.0
         assert window.training.fixation_max.value() == 3.0
-        assert "+4200 ms" in window.presentation.note.text()
-        assert window.training.selected_classifiers() == ["logreg", "svm", "forest"]
+        assert "+2700 ms" in window.presentation.note.text()
+        assert window.training.selected_model_pairs() == [("valence", "logreg")]
+        for index, box in enumerate(window.training.electrode_boxes):
+            box.setChecked(index in (0, 2, 7))
+        assert window.extractor.eeg.electrodes == ("Fz", "Cz", "PO8")
+        assert window.extractor.eeg.device_channels == (0, 2, 7)
+        assert len(window.features.quality_labels) == 8
+        for key in ("svm", "forest"):
+            window.training.train_boxes[("valence", key)].setChecked(True)
+        assert not window.training.train_boxes[("valence", "svm_linear")].isEnabled()
+        window.training.train_boxes[("valence", "forest")].setChecked(False)
+        assert window.training.train_boxes[("valence", "svm_linear")].isEnabled()
+        window.training.train_boxes[("valence", "svm")].setChecked(False)
+        assert window.training.selected_model_pairs() == [("valence", "logreg")]
         assert len(window.features.quality_map.POSITIONS) == 8
         assert all(rating.good is None for rating in window.features.quality_map.ratings)
         assert not window.features.quality_map.grab().isNull()
         panel = window.features
         panel.mode.setCurrentText(panel.MODE_BAND)
         panel.band.setCurrentText("beta")
-        assert [label for _, label in panel.shown] == ["Fz", "C3", "Cz", "C4", "P3", "Pz", "P4", "Oz"]
+        assert [label for _, label in panel.shown] == ["Fz", "C3", "Cz", "C4", "Pz", "PO7", "Oz", "PO8"]
         panel.mode.setCurrentText(panel.MODE_ELECTRODE)
         panel.electrode.setCurrentText("Cz")
         assert [label for _, label in panel.shown] == ["alpha", "beta", "gamma"]
@@ -120,7 +150,7 @@ def test_chosen_key_stops_from_presentation_window(tmp_path: Path, monkeypatch):
         panel.mode.setCurrentText(panel.MODE_ELECTRODE)
         assert len(panel.plots) == 3                          # one plot per band
         panel.mode.setCurrentText(panel.MODE_FD)
-        panel.add(1.0, np.arange(len(window.extractor.names), dtype=float))
+        panel.add(1.0, np.arange(len(window.display_extractor.names), dtype=float))
         assert panel.current.text().startswith("Current values: Fz")
         panel.clear()   # the fake sample above must not leak into the stream checks below
         window.training.image_seconds.setValue(2.0)
@@ -132,23 +162,30 @@ def test_chosen_key_stops_from_presentation_window(tmp_path: Path, monkeypatch):
             window.poll()
             assert window.training.start.isEnabled()
             assert not window.features.samples
+            assert window.features.raw_sample_count >= 500
+            assert all("Good" in label.text() for label in window.features.quality_labels)
             if key_name == "Escape":
-                for key, box in window.training.train_boxes.items():
-                    box.setChecked(key == "svm")
+                for pair, box in window.training.train_boxes.items():
+                    box.setChecked(pair == ("valence", "svm"))
             else:
-                for key, box in window.training.train_boxes.items():
-                    box.setChecked(key in ("logreg", "svm", "forest"))
+                for pair, box in window.training.train_boxes.items():
+                    box.setChecked(pair[1] in ("logreg", "svm", "forest"))
             window.training.stop_key.setCurrentText(key_name)
             window.start_run()
             app.processEvents()
             assert window.active
             window.poll()
             assert window.features.samples
+            assert window.features.raw_sample_count == 0
+            assert not window.features.oscar_toggle.isEnabled()
             assert window.training.settings_scroll.isHidden()
             assert window.training.accuracy.columnCount() == 6
-            assert window.training.accuracy.rowCount() == (2 if key_name == "Escape" else 6)
+            assert window.training.accuracy.rowCount() == (1 if key_name == "Escape" else 6)
+            assert all(model.n_features == 12 for model in window.trainer.models.values())
             assert window.run_metadata["classifiers"] == (["svm"] if key_name == "Escape" else ["logreg", "svm", "forest"])
+            assert len(window.run_metadata["training_model_pairs"]) == (1 if key_name == "Escape" else 6)
             assert window.run_metadata["epoch_end_ms"] == 1700
+            assert window.run_metadata["model_device_channels"] == (0, 2, 7)
             assert window.run_metadata["fixation_min_s"] == 2.0
             assert window.run_metadata["fixation_max_s"] == 4.0
             presentation = window.presentation_window
@@ -168,9 +205,12 @@ def test_chosen_key_stops_from_presentation_window(tmp_path: Path, monkeypatch):
             assert len(window.features.samples) == frozen_count
             assert window.features.current.text() == frozen_value
             assert window.features.quality_map.ratings == frozen_lights
+            assert window.features.raw_sample_count > 0
+            assert window.features.oscar_toggle.isEnabled()
             window.device.connected = False
             window.device.connected_changed.emit(False)
             assert not window.features.samples
+            assert window.features.raw_sample_count == 0
             assert window.features.current.text() == "Current values: —"
             window.discard_run()
             assert not window.training.start.isEnabled()
@@ -187,7 +227,15 @@ def test_chosen_key_stops_from_presentation_window(tmp_path: Path, monkeypatch):
         window.device.connected = False
         window.device.connected_changed.emit(False)
         assert not window.features.samples
+        assert window.features.raw_sample_count == 0
         window.discard_run()
+        window.features.oscar_toggle.setChecked(False)
+        assert not window.training.oscar.isChecked()
+        assert not window.device.oscar
+        assert window.features.raw_sample_count == 0
+        window.training.oscar.setChecked(True)
+        assert window.features.oscar_toggle.isChecked()
+        assert window.device.oscar
         trainer = MultiTrainer(["valence", "arousal"], ["logreg", "svm", "forest"],
                                len(window.extractor.names))
         for number in range(16):

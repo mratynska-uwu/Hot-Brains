@@ -20,16 +20,24 @@ MIN_TRIALS = 10
 ROLLING = 20
 
 
-class TrialPlan:
-    """Balanced across dataset folders; each folder cycles its images before repeating."""
+def balanced_unique_capacity(groups: dict[str, list[StimulusImage]]) -> int:
+    """Largest balanced finite run that never repeats an image."""
+    return len(groups) * min((len(items) for items in groups.values()), default=0)
 
-    def __init__(self, groups: dict[str, list[StimulusImage]], total: int | None, rng: random.Random | None = None):
+
+class TrialPlan:
+    """Balanced across groups; each group cycles its images before repeating."""
+
+    def __init__(self, groups: dict[str, list[StimulusImage]], total: int | None,
+                 rng: random.Random | None = None, allow_repeats: bool = True):
         if not groups or not all(groups.values()):
-            raise ValueError("Every dataset folder needs at least one image.")
+            raise ValueError("Every trial group needs at least one image.")
         names = list(groups)
         if total is not None and (total < len(names) or total % len(names)):
             raise ValueError(f"The finite trial count must be a positive multiple of {len(names)} "
-                             "(the number of dataset folders) for exact balance.")
+                             "(the number of trial groups) for exact balance.")
+        if not allow_repeats and (total is None or total > balanced_unique_capacity(groups)):
+            raise ValueError("A no-repeat run needs a finite trial count within the available images per group.")
         self.rng = rng or random.Random()
         self.groups = groups
         self.names = names
@@ -103,11 +111,17 @@ class OnlineTrainer:
 class MultiTrainer:
     """All (target, classifier) models trained side by side on the same epochs."""
 
-    def __init__(self, targets: list[str], classifier_keys: list[str], n_features: int):
+    def __init__(self, targets: list[str], classifier_keys: list[str], n_features: int,
+                 selected_pairs: list[tuple[str, str]] | None = None):
         self.targets = list(targets)
         self.classifier_keys = list(classifier_keys)
+        pairs = ([(t, c) for t in self.targets for c in self.classifier_keys]
+                 if selected_pairs is None else list(selected_pairs))
+        if len(pairs) != len(set(pairs)) or any(t not in self.targets or c not in self.classifier_keys
+                                                for t, c in pairs):
+            raise ValueError("Selected target/model pairs must be unique and configured")
         self.models: dict[tuple[str, str], OnlineTrainer] = {
-            (t, c): OnlineTrainer(c, n_features) for t in self.targets for c in self.classifier_keys}
+            (t, c): OnlineTrainer(c, n_features) for t, c in pairs}
 
     def add(self, features: np.ndarray, labels: dict[str, int]) -> dict[tuple[str, str], Prediction]:
         out = {}

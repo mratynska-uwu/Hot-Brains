@@ -2,6 +2,7 @@ import copy
 import csv
 import json
 import random
+import time
 from pathlib import Path
 
 import numpy as np
@@ -13,7 +14,7 @@ from hotbrain.acquisition import DeviceManager, SampleRing
 from hotbrain.config import CONFIG, AppConfig, EEGSettings
 from hotbrain.dataset import StimulusImage, load_dataset
 from hotbrain.features import EpochSpec, FeatureExtractor, higuchi_fd
-from hotbrain.training import MultiTrainer, TrialPlan, predict_saved
+from hotbrain.training import MultiTrainer, TrialPlan, balanced_unique_capacity, predict_saved
 
 ROOT = Path(__file__).resolve().parents[1]
 EEG = EEGSettings.from_dict(CONFIG["eeg"])
@@ -46,9 +47,37 @@ def test_stream_ready_requires_recent_sdk_frames(monkeypatch):
         device.close()
 
 
+def test_one_bad_scan_skips_clean_start_requirement_but_keeps_live_stream(monkeypatch):
+    QCoreApplication.instance() or QCoreApplication([])
+    monkeypatch.setattr(DeviceManager, "_tick", lambda self: None)
+    device = DeviceManager(EEG)
+    try:
+        device.connected = True
+        device.pipeline = type("PipelineStub", (), {"get_condition": lambda self: "Healthy"})()
+        emitted = []
+        device.marker = type("MarkerStub", (), {"emit": lambda self, code: emitted.append(code)})()
+        device.ring.append(np.ones((EEG.fs, N_CH)))
+        assert device.stream_ready()
+        device.ring.append(np.full((1, N_CH), np.nan))
+        assert not device.stream_ready()
+        assert device.stream_live()
+        assert device.mark_image(time.perf_counter())[0] == 1
+        assert emitted == [1]
+        device.ring.append(np.full((EEG.fs, N_CH), np.nan))
+        assert not device.stream_live()
+    finally:
+        device.close()
+
+
 def test_config_matches_basic_info():
     assert EEG.fs == 250
-    assert EEG.electrodes == ("Fz", "C3", "Cz", "C4", "P3", "Pz", "P4", "Oz")
+    assert EEG.electrodes == ("Fz", "C3", "Cz", "C4", "Pz", "PO7", "Oz", "PO8")
+    assert EEG.device_channels == tuple(range(8))
+    assert dict(EEG.regions) == {
+        "frontal": ("Fz",), "central": ("C3", "Cz", "C4"),
+        "parietal": ("Pz",), "posterior": ("PO7", "Oz", "PO8"),
+    }
+    assert EEG.asymmetry_pairs == (("C4", "C3"), ("PO8", "PO7"))
     assert EEG.bandpass_hz == (1, 48)
     assert EEG.notch_hz == 50
     assert [name for name, _ in EEG.bands_hz] == ["alpha", "beta", "gamma"]
@@ -168,6 +197,33 @@ def test_finite_plan_balances_and_uses_images_before_repeating(tmp_path):
         TrialPlan(groups, 21)
 
 
+def test_no_repeat_plan_respects_balanced_capacity(tmp_path):
+    groups = _images(tmp_path, n=3)
+    groups["joy"].append(StimulusImage(tmp_path / "extra.png", "joy", {"valence": 1}))
+    assert balanced_unique_capacity(groups) == 6
+    plan = TrialPlan(groups, 6, random.Random(5), allow_repeats=False)
+    shown = [plan.next().path for _ in range(6)]
+    assert len(set(shown)) == 6
+    with pytest.raises(ValueError, match="no-repeat"):
+        TrialPlan(groups, 8, allow_repeats=False)
+    with pytest.raises(ValueError, match="finite"):
+        TrialPlan(groups, None, allow_repeats=False)
+
+
+def test_selected_electrodes_preserve_device_mapping_and_drop_unavailable_asymmetry():
+    selected = EEG.select_electrodes((7, 0, 2))
+    assert selected.electrodes == ("Fz", "Cz", "PO8")
+    assert selected.device_channels == (0, 2, 7)
+    extractor = FeatureExtractor(selected)
+    assert len(extractor.names) == 12
+    assert set(info.location for info in extractor.info) == {"Fz", "Cz", "PO8"}
+    extended = copy.deepcopy(CONFIG["eeg"])
+    extended["features"].append("asymmetry")
+    assert "asymmetry" not in EEGSettings.from_dict(extended).select_electrodes((0, 2)).features
+    with pytest.raises(ValueError, match="at least one"):
+        EEG.select_electrodes(())
+
+
 def test_features_follow_config():
     extractor = FeatureExtractor(EEG)
     spec = extractor.epoch_spec(1000)
@@ -251,6 +307,8 @@ def test_forest_prequential_probabilities_and_selective_save(tmp_path):
     assert {path.name for path in written} == {"run.json", "run.valence.forest.joblib"}
     manifest = json.loads((tmp_path / "run.json").read_text(encoding="utf-8"))
     assert manifest["saved_models"] == ["valence/forest"]
+
+
     assert manifest["models"]["valence/forest"]["selected_for_save"] is True
     assert manifest["models"]["valence/logreg"]["model_file"] is None
     assert manifest["models"]["valence/svm"]["model_file"] is None
@@ -264,6 +322,16 @@ def test_forest_prequential_probabilities_and_selective_save(tmp_path):
         trainer.save(tmp_path / "unknown", {}, {("valence", "missing")})
     assert not (tmp_path / "empty.json").exists()
     assert not (tmp_path / "unknown.json").exists()
+
+
+def test_target_model_pairs_do_not_create_unselected_cross_products():
+    pairs = [("valence", "logreg"), ("arousal", "forest")]
+    trainer = MultiTrainer(["valence", "arousal"], ["logreg", "forest"], 20, pairs)
+    assert list(trainer.models) == pairs
+    trainer.add(np.ones(20), {"valence": 1, "arousal": 0})
+    assert all(len(model.x) == 1 for model in trainer.models.values())
+    with pytest.raises(ValueError, match="unique"):
+        MultiTrainer(["valence"], ["logreg"], 20, [("valence", "logreg")] * 2)
 
 
 def test_bursty_frame_arrivals_preserve_a_complete_epoch(monkeypatch):
@@ -338,5 +406,6 @@ def test_fabricated_unicorn_scans_are_never_used(monkeypatch):
     ring.append(frame, marker_channel=11, validation_channel=10)
     assert ring.marker_sample(23) == 75
     assert ring.epoch(23, EpochSpec()) is None
+    assert ring.epoch_result(23, EpochSpec())[1] == "invalid_scans"
     assert np.isnan(ring.recent(1)[1][180]).all()
     assert not ring.valid_recent(.5)

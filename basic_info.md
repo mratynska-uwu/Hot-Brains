@@ -1,4 +1,4 @@
-Electrodes: Fz, C3, Cz, C4, P3, PZ, P4, Oz
+Electrodes (confirmed physical Unicorn cap, channels 1-8): Fz, C3, Cz, C4, Pz, PO7, Oz, PO8
 sampling rate 250 Hz
 bandpass filer 1 - 48 Hz 
 notch filter 50 Hz

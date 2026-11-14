@@ -40,14 +40,19 @@ class SignalQuality:
         if len(data) < self.window:
             return self.waiting(f"Waiting for {WINDOW_SECONDS} seconds of EEG")
         low, high = self.eeg.bandpass_hz
+        recent = data[-self.window:].copy()
+        finite = np.isfinite(recent).all(axis=0)
+        recent[:, ~finite] = 0  # Keep one bad electrode from affecting the others.
+        filtered = sosfiltfilt(self.sos, recent, axis=0)
+        rms_values = np.sqrt(np.mean(filtered ** 2, axis=0))
+        swings = np.ptp(filtered, axis=0)
         results = []
-        for channel in data[-self.window:].T:
-            if not np.isfinite(channel).all():
+        for index in range(n):
+            if not finite[index]:
                 results.append(ChannelQuality(False, "Non-finite samples"))
                 continue
-            filtered = sosfiltfilt(self.sos, channel)
-            rms = float(np.sqrt(np.mean(filtered ** 2)))
-            swing = float(np.ptp(filtered))
+            rms = float(rms_values[index])
+            swing = float(swings[index])
             detail = f"{low:g}–{high:g} Hz RMS {rms:.1f} µV; range {swing:.1f} µV"
             if rms < 1 or swing < 4:
                 results.append(ChannelQuality(False, f"Flat or very weak signal · {detail}"))
