@@ -24,7 +24,7 @@ Everything that differs between experiments lives in one dictionary, `CONFIG`. `
 | `image_column` | `image_name` | CSV column holding the file name. |
 | `eeg` | from `basic_info.md` | `sampling_rate` 250, `electrodes` Fz, C3, Cz, C4, P3, Pz, P4, Oz, `bandpass_hz` 1–48, `notch_hz` 50, `bands_hz` alpha/beta/gamma, `features` band power + fractal dimension. Also `regions`, `asymmetry_pairs`, `erp_windows_ms`, `fractal_kmax` and `device_channels`. |
 | `targets` | valence, arousal | Each target gets one value per image: a single CSV column (`"column": "aroused_mean"`) or a weighted sum of columns (`"columns": {"positive_mean": 1, "negative_mean": -1}`). The binary label comes from that value. With `threshold: None` the value must already be 0/1. A number or `"median"` makes label 1 mean the value is above the threshold. To analyse something else, add or replace entries (e.g. `approach_mean`). |
-| `classifiers` | `["logreg", "svm"]` | Classifiers ticked by default in the GUI. |
+| `classifiers` | `["logreg", "svm"]` | Models compared by default in the GUI. |
 
 Defaults:
 
@@ -35,7 +35,7 @@ Defaults:
 - **`device_channels`**: `None` assumes the eight electrodes are on Unicorn channels 1–8 in the listed order. The Unicorn's stock order is Fz, C3, Cz, C4, Pz, PO7, Oz, PO8. If the wiring differs, list the channel index (0–7) for each electrode.
 - **Bandpass** is 1–48 Hz so that the gamma band (30–45 Hz) is kept. The 50 Hz notch stays on. If a configured band falls outside the bandpass, the app shows a warning.
 
-**Adding a classifier:** in `hotbrain/classifiers.py` call `register_classifier("key", "Label", factory)`, where `factory` returns any unfitted scikit-learn estimator. It appears as a checkbox in the GUI. Every estimator is wrapped in a `StandardScaler` pipeline. Built-in keys: `logreg` (L2 logistic regression), `svm` (RBF), `svm_linear`.
+**Adding a classifier:** in `hotbrain/classifiers.py` call `register_classifier("key", "Label", factory)`, where `factory` returns any unfitted scikit-learn estimator. It appears in the GUI's model menu. Every estimator is wrapped in a `StandardScaler` pipeline. Estimators without `predict_proba` are wrapped in 3-fold sigmoid calibration, including scaling within each calibration fold. Built-in keys: `logreg` (L2 logistic regression), `svm` (RBF), `svm_linear`.
 
 ## Operator flow
 
@@ -44,14 +44,14 @@ Defaults:
    - Finite runs shuffle an exactly balanced list of folders.
    - Continuous mode draws a folder uniformly at random.
    - Each folder cycles through its images without replacement before reusing them.
-3. Tick the classifiers to compare.
+3. Choose a model from the **Model selection** menu: L2 logistic, RBF SVM, linear SVM, the configured comparison (logistic + RBF SVM by default), or all models. This changes the models trained in the next run; each selected model gets its own accuracy row and saved file.
 4. Set image duration (default 1.0 s) and fixation minimum/maximum (default 0.6–1.0 s, drawn uniformly). Choose OSCAR and optional pretrial settling.
 5. Wait until the device status says connected, then start. Trials shown during connection setup have no complete EEG epoch.
 6. The image tab opens in an independent window; maximize it on the participant display. The other two tabs can also detach.
 7. Stop with the button or the selected stop key (Escape by default), or let a finite run end.
 8. Save the fitted models (needs at least ten usable epochs with both labels for a model) or discard the run. With no EEG, the trial sequence still runs and no model or accuracy is fabricated.
 
-The training tab shows a table and a plot with the rolling accuracy of the last 20 **test-before-train** predictions for every target/classifier pair. It also shows standardized weights for linear models.
+The training tab shows a table and a plot with the rolling accuracy of the last 20 **test-before-train** predictions for every target/classifier pair. The table also shows the latest P(class 1) (positive valence or high arousal) and standardized weights for linear models.
 
 ## EEG epochs and features
 
@@ -77,7 +77,7 @@ The EEG features window shows one live signal-check light per configured electro
 - `<stem>.<target>.<classifier>.joblib`: one fitted scikit-learn pipeline per model.
 - `<stem>.epochs.npz`: accepted epochs (µV) with per-target labels (`label_<target>`), continuous values (`value_<target>`) and groups.
 
-`hotbrain.training.predict_saved(path, features)` returns P(label 1), or the 0/1 prediction for SVMs, which have no probabilities. joblib uses pickle, so only load files you created.
+`hotbrain.training.predict_saved(path, features)` returns P(label 1) for both logistic regression and the calibrated SVMs. Existing SVM files saved by an earlier version have no calibrated probability output and must be retrained for this helper. SVM probabilities use cross-validated sigmoid calibration and can be unstable with very few EEG trials; do not interpret them as validated emotional intensity. joblib uses pickle, so only load files you created.
 
 ## OSCAR and timing limits
 
@@ -100,7 +100,7 @@ What changed compared with the original happy/sad trainer:
   - features are band power + Higuchi fractal dimension, 20 by default. Asymmetry and ERP features are optional.
 - **Targets**: separate valence (`positive_mean − negative_mean > 0`) and arousal (`aroused_mean` > median) classification. Each target is defined by one column or a weighted sum of columns, so other targets can be added.
 - **Data**: `valence` and `arousal` columns added to `data/training/*.csv` for easy comparison with other datasets. All original columns are unchanged.
-- **Classifiers**: a registry (`hotbrain/classifiers.py`) with logistic regression, RBF SVM and linear SVM. Every target × selected classifier is trained and evaluated test-before-train in parallel, and the GUI shows each one's rolling accuracy and linear weights.
+- **Classifiers**: a registry (`hotbrain/classifiers.py`) with logistic regression, RBF SVM and linear SVM. The GUI's model menu selects one or compares several. Every target × selected classifier is trained and evaluated test-before-train in parallel, and the GUI shows each one's rolling accuracy and linear weights. SVMs now use cross-validated sigmoid calibration to provide probabilities.
 - **Trial plan**: trials are balanced across dataset folders, and the trial count must be a multiple of the number of folders.
 - **Saving**: one `.joblib` per model, a manifest with the full config, resolved thresholds and per-trial predictions, and epochs with labels and continuous target values.
 - **GUI**: the electrode map follows the configured montage and has 10-20 positions for common electrodes.

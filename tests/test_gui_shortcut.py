@@ -61,11 +61,19 @@ def test_chosen_key_stops_from_detached_presentation(tmp_path: Path, monkeypatch
         window.training.fixation_max.setValue(4.0)
         assert "+1700 ms" in window.presentation.note.text()
         for key_name, key_code in (("Escape", Qt.Key.Key_Escape), ("F8", Qt.Key.Key_F8)):
+            if key_name == "Escape":
+                svm_index = next(i for i in range(window.training.model_choice.count())
+                                 if window.training.model_choice.itemData(i) == ["svm"])
+                window.training.model_choice.setCurrentIndex(svm_index)
+            else:
+                window.training.model_choice.setCurrentIndex(0)
             window.training.stop_key.setCurrentText(key_name)
             window.start_run()
             app.processEvents()
             assert window.active
-            assert window.training.accuracy.rowCount() == 4  # 2 targets x 2 default classifiers
+            assert window.training.accuracy.columnCount() == 5
+            assert window.training.accuracy.rowCount() == (2 if key_name == "Escape" else 4)
+            assert window.run_metadata["classifiers"] == (["svm"] if key_name == "Escape" else ["logreg", "svm"])
             assert window.run_metadata["epoch_end_ms"] == 1700
             assert window.run_metadata["fixation_min_s"] == 2.0
             assert window.run_metadata["fixation_max_s"] == 4.0

@@ -106,6 +106,7 @@ class TrainingPanel(QWidget):
     def __init__(self, config: AppConfig, min_image_s: float):
         super().__init__()
         self.n_groups = len(config.datasets)
+        self.class1_names = {target.name: target.classes[1] for target in config.targets}
         layout = QVBoxLayout(self)
         heading = QLabel("Scene emotion training")
         heading.setObjectName("heading")
@@ -161,15 +162,22 @@ class TrainingPanel(QWidget):
         self.warmup_seconds.setValue(12)
         self.warmup_seconds.setSuffix(" s")
         form.addRow("Settling duration", self.warmup_seconds)
-        classifier_row = QHBoxLayout()
-        self.classifier_boxes: dict[str, QCheckBox] = {}
+        self.model_choice = QComboBox()
+        defaults = list(config.classifiers)
+        if defaults:
+            names = " + ".join(classifiers.CLASSIFIERS[key].label for key in defaults)
+            self.model_choice.addItem(f"Compare configured models: {names}" if len(defaults) > 1 else names,
+                                      defaults)
         for key, spec in classifiers.CLASSIFIERS.items():
-            box = QCheckBox(spec.label)
-            box.setChecked(key in config.classifiers)
-            self.classifier_boxes[key] = box
-            classifier_row.addWidget(box)
-        classifier_row.addStretch()
-        form.addRow("Classifiers", classifier_row)
+            if [key] != defaults:
+                self.model_choice.addItem(spec.label, [key])
+        all_keys = list(classifiers.CLASSIFIERS)
+        if all_keys != defaults:
+            self.model_choice.addItem("Compare all available models", all_keys)
+        form.addRow("Model selection", self.model_choice)
+        model_note = QLabel("SVM probabilities use cross-validated sigmoid calibration. Each selected model is evaluated on new EEG trials before refitting.")
+        model_note.setWordWrap(True)
+        form.addRow("", model_note)
         layout.addLayout(form)
         self.dataset_status = QLabel()
         self.dataset_status.setWordWrap(True)
@@ -210,8 +218,8 @@ class TrainingPanel(QWidget):
         layout.addWidget(self.device_status)
         self.count_status = QLabel("Trials: 0 · usable EEG: 0")
         layout.addWidget(self.count_status)
-        self.accuracy = QTableWidget(0, 4)
-        self.accuracy.setHorizontalHeaderLabels(("Target", "Classifier", f"Last {ROLLING} held-out correct", "Predictions"))
+        self.accuracy = QTableWidget(0, 5)
+        self.accuracy.setHorizontalHeaderLabels(("Target (class 1)", "Classifier", f"Last {ROLLING} held-out correct", "Predictions", "Latest P(class 1)"))
         self.accuracy.horizontalHeader().setStretchLastSection(True)
         self.accuracy.setColumnWidth(1, 220)
         self.accuracy.setColumnWidth(2, 200)
@@ -233,7 +241,7 @@ class TrainingPanel(QWidget):
         self.curves: dict[tuple[str, str], tuple[object, list[int], list[float]]] = {}
 
     def selected_classifiers(self) -> list[str]:
-        return [key for key, box in self.classifier_boxes.items() if box.isChecked()]
+        return list(self.model_choice.currentData() or [])
 
     def configure_models(self, model_keys: list[tuple[str, str]], feature_names: tuple[str, ...]):
         """Reset the accuracy table, curves and weight table for a new run."""
@@ -245,7 +253,7 @@ class TrainingPanel(QWidget):
         self.accuracy.setRowCount(len(model_keys))
         for row, (target, clf) in enumerate(model_keys):
             label = classifiers.CLASSIFIERS[clf].label
-            for col, text in enumerate((target, label, "—", "0")):
+            for col, text in enumerate((f"{target} ({self.class1_names[target]})", label, "—", "0", "—")):
                 self.accuracy.setItem(row, col, QTableWidgetItem(text))
             pen = pg.mkPen(CURVE_COLORS[row % len(CURVE_COLORS)], width=3)
             curve = self.plot.plot(pen=pen, symbol="o", symbolSize=5, name=f"{target} · {label}")
@@ -273,6 +281,8 @@ class TrainingPanel(QWidget):
             self.accuracy.item(row, 2).setText(
                 "—" if accuracy is None else f"{accuracy:.1f}% (of {min(ROLLING, len(model.predictions))})")
             self.accuracy.item(row, 3).setText(str(len(model.predictions)))
+            self.accuracy.item(row, 4).setText(
+                "—" if not model.predictions else f"{model.predictions[-1].probability:.3f}")
             weights = classifiers.coefficients(model.model)
             for feature in range(self.weights.rowCount()):
                 if model.model is None:
@@ -555,7 +565,7 @@ class MainWindow(QMainWindow):
     def _settings_widgets(self) -> list[QWidget]:
         t = self.training
         return [t.participant, t.serial, t.count, t.persistent, t.stop_key, t.oscar, t.warmup, t.warmup_seconds,
-                t.image_seconds, t.fixation_min, t.fixation_max, *t.classifier_boxes.values()]
+                t.image_seconds, t.fixation_min, t.fixation_max, t.model_choice]
 
     def load_dataset(self, show_errors: bool = True) -> Dataset | None:
         try:

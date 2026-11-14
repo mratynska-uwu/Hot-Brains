@@ -156,13 +156,19 @@ def test_separate_models_per_target_and_classifier(tmp_path, classifiers):
     assert set(trainer.models) == {(t, c) for t in ("valence", "arousal") for c in classifiers}
     for (target, clf), model in trainer.models.items():
         assert model.model is not None
-        assert model.rolling_accuracy >= 80, (target, clf, model.rolling_accuracy)
+        # Sigmoid calibration optimizes probabilities and can move the 0.5
+        # boundary on this small synthetic sample.
+        assert model.rolling_accuracy >= (70 if clf == "svm" else 80), (target, clf, model.rolling_accuracy)
+        assert all(p.probability is not None and 0 < p.probability < 1 and
+                   p.label == int(p.probability >= .5) for p in model.predictions)
     written = trainer.save(tmp_path / "run", {"participant": "test"})
     assert written[0].suffix == ".json" and len(written) == 1 + 2 * len(classifiers)
     probe = np.zeros(n)
     probe[0] = 3
     model_path = tmp_path / f"run.valence.{classifiers[0]}.joblib"
-    assert predict_saved(model_path, probe) > .5  # P(class 1), or the predicted label for SVMs
+    saved_probability = predict_saved(model_path, probe)
+    assert .5 < saved_probability < 1
+    assert np.isclose(saved_probability, trainer.models[("valence", classifiers[0])].model.predict_proba(probe[None, :])[0, 1])
 
 
 def test_bursty_frame_arrivals_preserve_a_complete_epoch(monkeypatch):

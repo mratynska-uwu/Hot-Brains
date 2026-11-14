@@ -59,7 +59,7 @@ class TrialPlan:
 @dataclass
 class Prediction:
     label: int
-    probability: float | None  # P(label 1), when the classifier provides it
+    probability: float  # calibrated P(label 1) for SVMs
     correct: bool
 
 
@@ -80,15 +80,15 @@ class OnlineTrainer:
             raise ValueError("Invalid EEG feature vector")
         prediction = None
         if self.model is not None:
-            predicted = int(self.model.predict(features[None, :])[0])
-            probability = None
-            if hasattr(self.model, "predict_proba"):
-                probability = float(self.model.predict_proba(features[None, :])[0, 1])
+            probability = float(self.model.predict_proba(features[None, :])[0, 1])
+            predicted = int(probability >= .5)
             prediction = Prediction(predicted, probability, predicted == label)
             self.predictions.append(prediction)
         self.x.append(features)
         self.y.append(int(label))
-        if len(self.x) >= MIN_TRIALS and len(set(self.y)) == 2 and min(self.y.count(0), self.y.count(1)) >= 2:
+        minimum_per_class = 3 if classifiers.needs_calibration(self.classifier) else 2
+        if len(self.x) >= MIN_TRIALS and len(set(self.y)) == 2 \
+                and min(self.y.count(0), self.y.count(1)) >= minimum_per_class:
             model = classifiers.build(self.classifier)
             model.fit(np.vstack(self.x), np.asarray(self.y))
             self.model = model
@@ -127,7 +127,9 @@ class MultiTrainer:
         written = []
         summary = {}
         for (target, clf), trainer in self.models.items():
-            entry = {"classifier": classifiers.CLASSIFIERS[clf].label, "n_eeg_trials": len(trainer.x),
+            entry = {"classifier": classifiers.CLASSIFIERS[clf].label,
+                     "probability_method": "3-fold cross-validated sigmoid calibration" if classifiers.needs_calibration(clf) else "native",
+                     "n_eeg_trials": len(trainer.x),
                      "n_predictions": len(trainer.predictions), "rolling_accuracy": trainer.rolling_accuracy,
                      "model_file": None}
             if trainer.model is not None:
@@ -137,18 +139,18 @@ class MultiTrainer:
                 written.append(path)
             summary[f"{target}/{clf}"] = entry
         metadata_path = stem.with_suffix(".json")
-        record = {**metadata, "schema": 2, "models": summary}
+        record = {**metadata, "schema": 3, "models": summary}
         metadata_path.write_text(json.dumps(record, indent=2, default=str), encoding="utf-8")
         return [metadata_path, *written]
 
 
 def predict_saved(model_path: Path, features: np.ndarray) -> float:
-    """P(label 1) from a saved model, or its 0/1 prediction if it has no probabilities (SVM).
+    """P(label 1) from a saved model, including calibrated SVMs.
 
     joblib uses pickle: only load files you created.
     """
     model = joblib.load(model_path)
     features = np.asarray(features, dtype=np.float64)[None, :]
-    if hasattr(model, "predict_proba"):
-        return float(model.predict_proba(features)[0, 1])
-    return float(model.predict(features)[0])
+    if not hasattr(model, "predict_proba"):
+        raise ValueError("This saved model has no probability output; retrain it with the current app.")
+    return float(model.predict_proba(features)[0, 1])

@@ -2,8 +2,8 @@
 
 Add a new one with ``register_classifier("key", "Label", factory)`` where the
 factory returns an unfitted scikit-learn estimator. Every estimator is wrapped
-in a StandardScaler pipeline and must support ``predict``; ``predict_proba``
-is used when available.
+in a StandardScaler pipeline. Estimators without ``predict_proba`` are
+calibrated with cross-validated sigmoid calibration around the whole pipeline.
 """
 from __future__ import annotations
 
@@ -11,8 +11,9 @@ from dataclasses import dataclass
 from typing import Callable
 
 from sklearn.base import BaseEstimator
+from sklearn.calibration import CalibratedClassifierCV
 from sklearn.linear_model import LogisticRegression
-from sklearn.pipeline import Pipeline, make_pipeline
+from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
 from sklearn.svm import SVC
 
@@ -31,16 +32,27 @@ def register_classifier(key: str, label: str, factory: Callable[[], BaseEstimato
     CLASSIFIERS[key] = ClassifierSpec(key, label, factory)
 
 
-def build(key: str) -> Pipeline:
+def needs_calibration(key: str) -> bool:
+    return not hasattr(CLASSIFIERS[key].factory(), "predict_proba")
+
+
+def build(key: str) -> BaseEstimator:
     if key not in CLASSIFIERS:
         raise KeyError(f"Unknown classifier {key!r}; available: {sorted(CLASSIFIERS)}")
-    return make_pipeline(StandardScaler(), CLASSIFIERS[key].factory())
+    pipeline = make_pipeline(StandardScaler(), CLASSIFIERS[key].factory())
+    if needs_calibration(key):
+        # Keeping the scaler inside the estimator makes each calibration fold
+        # fit its own scaler on training data only.
+        return CalibratedClassifierCV(pipeline, method="sigmoid", cv=3, ensemble=False)
+    return pipeline
 
 
-def coefficients(model: Pipeline | None):
+def coefficients(model: BaseEstimator | None):
     """Standardized weights for linear models, else None."""
     if model is None:
         return None
+    if isinstance(model, CalibratedClassifierCV):
+        model = model.calibrated_classifiers_[0].estimator
     coef = getattr(model.steps[-1][1], "coef_", None)
     return None if coef is None else coef[0]
 
