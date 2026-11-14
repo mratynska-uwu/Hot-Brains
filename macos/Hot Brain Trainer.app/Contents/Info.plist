@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>en</string>
+	<key>CFBundleDisplayName</key>
+	<string>Hot Brain Trainer</string>
+	<key>CFBundleExecutable</key>
+	<string>HotBrainTrainer</string>
+	<key>CFBundleIconFile</key>
+	<string>HotBrain.icns</string>
+	<key>CFBundleIdentifier</key>
+	<string>local.hotbrain.trainer</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>Hot Brain Trainer</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>0.1.0</string>
+	<key>CFBundleVersion</key>
+	<string>1</string>
+	<key>LSApplicationCategoryType</key>
+	<string>public.app-category.education</string>
+	<key>NSBluetoothAlwaysUsageDescription</key>
+	<string>Connect to the Unicorn EEG headset for training.</string>
+	<key>NSHighResolutionCapable</key>
+	<true/>
+</dict>
+</plist>

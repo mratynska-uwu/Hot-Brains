@@ -1,0 +1,19 @@
+#!/bin/zsh
+bundle_parent="$(cd "$(dirname "$0")/../../.." && pwd)"
+if [[ -f "$bundle_parent/run.py" ]]; then
+    project_dir="$bundle_parent"
+elif [[ -f "$bundle_parent/Hot-Brains/run.py" ]]; then
+    project_dir="$bundle_parent/Hot-Brains"
+elif [[ -f "$bundle_parent/../run.py" ]]; then
+    project_dir="$(cd "$bundle_parent/.." && pwd)"
+else
+    project_dir=""
+fi
+if [[ -z "$project_dir" || ! -x "$project_dir/.venv/bin/python" || ! -f "$project_dir/run.py" ]]; then
+    /usr/bin/osascript -e 'display alert "Hot Brain Trainer could not start" message "Keep Hot Brain Trainer.app in Hot-Brains/macos or next to Hot-Brains, and set up its virtual environment."'
+    exit 1
+fi
+cd "$project_dir" || exit 1
+export LANG=en_US.UTF-8
+export LC_CTYPE=en_US.UTF-8
+exec "$project_dir/.venv/bin/python" "$project_dir/run.py" >> "$project_dir/launcher.log" 2>&1
