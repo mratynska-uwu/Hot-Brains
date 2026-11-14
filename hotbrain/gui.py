@@ -12,7 +12,7 @@ import pyqtgraph as pg
 from PySide6.QtCore import QPointF, QRectF, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QFont, QImageReader, QKeySequence, QLinearGradient, QPainter, QPainterPath, QPen, QPixmap, QShortcut
 from PySide6.QtWidgets import (
-    QApplication, QCheckBox, QComboBox, QDoubleSpinBox, QFormLayout, QHBoxLayout, QLabel,
+    QApplication, QCheckBox, QComboBox, QDoubleSpinBox, QFormLayout, QGridLayout, QHBoxLayout, QLabel,
     QLineEdit, QMainWindow, QMessageBox, QPushButton, QSpinBox, QTabWidget, QVBoxLayout,
     QWidget, QTableWidget, QTableWidgetItem, QToolTip,
 )
@@ -91,7 +91,7 @@ class PresentationPanel(QWidget):
         self.note = QLabel()
         self.note.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(self.note)
-        self.set_timing(.6, 1.0, EpochSpec())
+        self.set_timing(2.0, 3.0, EpochSpec(image_duration_ms=4500))
 
     def set_timing(self, fixation_min: float, fixation_max: float, spec: EpochSpec):
         self.note.setText(f"Fixation: {fixation_min:g}–{fixation_max:g} s   ·   Image: {spec.image_duration_ms / 1000:g} s   ·   EEG epoch: {START_MS} to +{spec.end_ms} ms")
@@ -111,6 +111,9 @@ class TrainingPanel(QWidget):
         heading = QLabel("Scene emotion training")
         heading.setObjectName("heading")
         layout.addWidget(heading)
+        self.settings_widget = QWidget()
+        settings_layout = QVBoxLayout(self.settings_widget)
+        settings_layout.setContentsMargins(0, 0, 0, 0)
         form = QFormLayout()
         self.participant = QLineEdit("debug")
         self.participant.setPlaceholderText("Participant ID")
@@ -131,21 +134,21 @@ class TrainingPanel(QWidget):
         self.image_seconds.setDecimals(2)
         self.image_seconds.setSingleStep(.1)
         self.image_seconds.setSuffix(" s")
-        self.image_seconds.setValue(max(1.0, min_image_s))
+        self.image_seconds.setValue(max(4.5, min_image_s))
         form.addRow("Image duration", self.image_seconds)
         self.fixation_min = QDoubleSpinBox()
         self.fixation_min.setRange(.2, 60.0)
         self.fixation_min.setDecimals(2)
         self.fixation_min.setSingleStep(.1)
         self.fixation_min.setSuffix(" s")
-        self.fixation_min.setValue(.6)
+        self.fixation_min.setValue(2.0)
         form.addRow("Fixation minimum", self.fixation_min)
         self.fixation_max = QDoubleSpinBox()
         self.fixation_max.setRange(.2, 60.0)
         self.fixation_max.setDecimals(2)
         self.fixation_max.setSingleStep(.1)
         self.fixation_max.setSuffix(" s")
-        self.fixation_max.setValue(1.0)
+        self.fixation_max.setValue(3.0)
         form.addRow("Fixation maximum", self.fixation_max)
         self.stop_key = QComboBox()
         self.stop_key.addItems(["Escape", "Space", "Enter", *[f"F{i}" for i in range(1, 13)],
@@ -162,35 +165,33 @@ class TrainingPanel(QWidget):
         self.warmup_seconds.setValue(12)
         self.warmup_seconds.setSuffix(" s")
         form.addRow("Settling duration", self.warmup_seconds)
-        self.model_choice = QComboBox()
-        defaults = list(config.classifiers)
-        if defaults:
-            names = " + ".join(classifiers.CLASSIFIERS[key].label for key in defaults)
-            self.model_choice.addItem(f"Compare configured models: {names}" if len(defaults) > 1 else names,
-                                      defaults)
-        for key, spec in classifiers.CLASSIFIERS.items():
-            if [key] != defaults:
-                self.model_choice.addItem(spec.label, [key])
-        all_keys = list(classifiers.CLASSIFIERS)
-        if all_keys != defaults:
-            self.model_choice.addItem("Compare all available models", all_keys)
-        form.addRow("Model selection", self.model_choice)
-        model_note = QLabel("SVM probabilities use cross-validated sigmoid calibration. Each selected model is evaluated on new EEG trials before refitting.")
+        model_grid = QWidget()
+        model_layout = QGridLayout(model_grid)
+        model_layout.setContentsMargins(0, 0, 0, 0)
+        self.train_boxes: dict[str, QCheckBox] = {}
+        for index, (key, spec) in enumerate(classifiers.CLASSIFIERS.items()):
+            box = QCheckBox(spec.label)
+            box.setChecked(key in config.classifiers)
+            self.train_boxes[key] = box
+            model_layout.addWidget(box, index // 2, index % 2)
+        form.addRow("Train models", model_grid)
+        model_note = QLabel("Selected models use the same EEG trials. SVM probabilities use cross-validated sigmoid calibration; random forest probabilities are native leaf averages. Each model predicts before refitting.")
         model_note.setWordWrap(True)
         form.addRow("", model_note)
-        layout.addLayout(form)
+        settings_layout.addLayout(form)
         self.dataset_status = QLabel()
         self.dataset_status.setWordWrap(True)
-        layout.addWidget(self.dataset_status)
+        settings_layout.addWidget(self.dataset_status)
         self.config_note = QLabel()
         self.config_note.setWordWrap(True)
         self.config_note.setObjectName("warning")
-        layout.addWidget(self.config_note)
+        settings_layout.addWidget(self.config_note)
         self.detail = QLabel(f"Finite runs are exactly balanced across the {self.n_groups} dataset folders and shuffled; "
                              "continuous runs draw a folder uniformly at random. Each target/classifier pair predicts a trial "
                              "before that trial is added to its fit. OSCAR adapts online; g.Pype does not expose a saved calibration state.")
         self.detail.setWordWrap(True)
-        layout.addWidget(self.detail)
+        settings_layout.addWidget(self.detail)
+        layout.addWidget(self.settings_widget)
         buttons = QHBoxLayout()
         self.start = QPushButton("Start training")
         self.stop = QPushButton("Stop training")
@@ -218,12 +219,13 @@ class TrainingPanel(QWidget):
         layout.addWidget(self.device_status)
         self.count_status = QLabel("Trials: 0 · usable EEG: 0")
         layout.addWidget(self.count_status)
-        self.accuracy = QTableWidget(0, 5)
-        self.accuracy.setHorizontalHeaderLabels(("Target (class 1)", "Classifier", f"Last {ROLLING} held-out correct", "Predictions", "Latest P(class 1)"))
+        self.accuracy = QTableWidget(0, 6)
+        self.accuracy.setHorizontalHeaderLabels(("Target (class 1)", "Classifier", f"Last {ROLLING} held-out correct", "Predictions", "Latest P(class 1)", "Save"))
         self.accuracy.horizontalHeader().setStretchLastSection(True)
         self.accuracy.setColumnWidth(1, 220)
         self.accuracy.setColumnWidth(2, 200)
-        self.accuracy.setMaximumHeight(170)
+        self.accuracy.setColumnWidth(4, 130)
+        self.accuracy.setMaximumHeight(240)
         layout.addWidget(self.accuracy)
         self.plot = pg.PlotWidget()
         self.plot.setBackground("#101827")
@@ -238,14 +240,38 @@ class TrainingPanel(QWidget):
         self.weights.setMaximumHeight(195)
         layout.addWidget(self.weights)
         self.model_keys: list[tuple[str, str]] = []
+        self.save_boxes: dict[tuple[str, str], QCheckBox] = {}
+        self.save_selection_ready = False
         self.curves: dict[tuple[str, str], tuple[object, list[int], list[float]]] = {}
 
     def selected_classifiers(self) -> list[str]:
-        return list(self.model_choice.currentData() or [])
+        return [key for key, box in self.train_boxes.items() if box.isChecked()]
+
+    def selected_save_models(self) -> set[tuple[str, str]]:
+        return {key for key, box in self.save_boxes.items() if box.isEnabled() and box.isChecked()}
+
+    def update_save_button(self):
+        self.save.setEnabled(self.save_selection_ready and bool(self.selected_save_models()))
+
+    def prepare_save_selection(self, trainer: MultiTrainer):
+        for key, box in self.save_boxes.items():
+            fitted = trainer.models[key].model is not None
+            box.setChecked(fitted)
+            box.setEnabled(fitted)
+        self.save_selection_ready = True
+        self.update_save_button()
+
+    def reset_save_selection(self):
+        self.save_selection_ready = False
+        for box in self.save_boxes.values():
+            box.setEnabled(False)
+        self.update_save_button()
 
     def configure_models(self, model_keys: list[tuple[str, str]], feature_names: tuple[str, ...]):
         """Reset the accuracy table, curves and weight table for a new run."""
         self.model_keys = list(model_keys)
+        self.reset_save_selection()
+        self.save_boxes = {}
         self.plot.clear()
         if self.plot.plotItem.legend is not None:
             self.plot.plotItem.legend.clear()
@@ -255,6 +281,12 @@ class TrainingPanel(QWidget):
             label = classifiers.CLASSIFIERS[clf].label
             for col, text in enumerate((f"{target} ({self.class1_names[target]})", label, "—", "0", "—")):
                 self.accuracy.setItem(row, col, QTableWidgetItem(text))
+            save_box = QCheckBox()
+            save_box.setToolTip(f"Save fitted {target} / {label} model")
+            save_box.setEnabled(False)
+            save_box.toggled.connect(self.update_save_button)
+            self.accuracy.setCellWidget(row, 5, save_box)
+            self.save_boxes[(target, clf)] = save_box
             pen = pg.mkPen(CURVE_COLORS[row % len(CURVE_COLORS)], width=3)
             curve = self.plot.plot(pen=pen, symbol="o", symbolSize=5, name=f"{target} · {label}")
             self.curves[(target, clf)] = (curve, [], [])
@@ -503,7 +535,7 @@ class MainWindow(QMainWindow):
         self.quality = SignalQuality(self.config.eeg)
         self.idle_spec = self.extractor.epoch_spec(max(1000, self.extractor.min_image_duration_ms))
         self.setWindowTitle("Hot Brain · scene training")
-        self.resize(1120, 860)
+        self.resize(1200, 950)
         self.training = TrainingPanel(self.config, self.extractor.min_image_duration_ms / 1000)
         self.device = DeviceManager(self.config.eeg, self.training.serial.text().strip() or None)
         self.presentation = PresentationPanel()
@@ -565,7 +597,7 @@ class MainWindow(QMainWindow):
     def _settings_widgets(self) -> list[QWidget]:
         t = self.training
         return [t.participant, t.serial, t.count, t.persistent, t.stop_key, t.oscar, t.warmup, t.warmup_seconds,
-                t.image_seconds, t.fixation_min, t.fixation_max, t.model_choice]
+                t.image_seconds, t.fixation_min, t.fixation_max, *t.train_boxes.values()]
 
     def load_dataset(self, show_errors: bool = True) -> Dataset | None:
         try:
@@ -656,6 +688,7 @@ class MainWindow(QMainWindow):
         self.shown = self.usable = self.skipped = 0
         self.training.start.setEnabled(False)
         self.training.stop.setEnabled(True)
+        self.training.settings_widget.setVisible(False)
         self.stop_shortcut.setEnabled(True)
         self.training.save.setEnabled(False)
         self.training.discard.setEnabled(False)
@@ -822,7 +855,7 @@ class MainWindow(QMainWindow):
     def finish_run(self):
         self.finishing = False
         self.training.status.setText(f"Stopped after {self.shown} presentations; {self.usable} usable EEG trials.")
-        self.training.save.setEnabled(self.trainer.any_fitted)
+        self.training.prepare_save_selection(self.trainer)
         self.training.discard.setEnabled(True)
         self.run_metadata.update({"stopped_at": datetime.now().astimezone().isoformat(),
                                   "presented_trials": self.shown, "skipped_eeg_trials": self.skipped,
@@ -831,6 +864,10 @@ class MainWindow(QMainWindow):
             self.training.status.setText(self.training.status.text() + " A model needs at least 10 usable EEG trials with both labels.")
 
     def save_model(self):
+        selected = self.training.selected_save_models()
+        if not selected:
+            QMessageBox.warning(self, "Cannot save", "Select at least one fitted model in the Save column.")
+            return
         directory = self.root / "saved_models"
         directory.mkdir(exist_ok=True)
         participant = "".join(c if c.isalnum() or c in "_-" else "_" for c in self.run_metadata["participant_id"])
@@ -838,7 +875,7 @@ class MainWindow(QMainWindow):
         epochs_path = stem.with_suffix(".epochs.npz")
         self.run_metadata["epochs_file"] = epochs_path.name
         try:
-            written = self.trainer.save(stem, self.run_metadata)
+            written = self.trainer.save(stem, self.run_metadata, selected)
         except ValueError as exc:
             QMessageBox.warning(self, "Cannot save", str(exc)); return
         labels = {f"label_{t}": np.asarray([row[t] for row in self.epoch_labels], dtype=np.uint8)
@@ -850,8 +887,9 @@ class MainWindow(QMainWindow):
                             group=np.asarray(self.epoch_groups, dtype=str),
                             channels=np.asarray(self.config.eeg.electrodes, dtype=str), **labels)
         self.training.status.setText(f"Saved {len(written) + 1} files to saved_models/{stem.name}.*")
-        self.training.save.setEnabled(False)
+        self.training.reset_save_selection()
         self.training.start.setEnabled(True)
+        self.training.settings_widget.setVisible(True)
         self.training.discard.setEnabled(False)
         self._enable_settings()
 
@@ -864,7 +902,8 @@ class MainWindow(QMainWindow):
         self.epoch_groups = []
         self.training.status.setText("Run discarded. Ready to start again.")
         self.training.start.setEnabled(True)
-        self.training.save.setEnabled(False)
+        self.training.settings_widget.setVisible(True)
+        self.training.reset_save_selection()
         self.training.discard.setEnabled(False)
         self._enable_settings()
 

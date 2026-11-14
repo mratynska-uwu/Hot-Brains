@@ -1,7 +1,7 @@
 """Trial allocation and prequential (test-before-train) classifiers.
 
 One model is trained per (target, classifier) pair, e.g. valence/logreg,
-valence/svm, arousal/logreg, arousal/svm, all on the same EEG feature vectors.
+valence/forest and arousal/svm, all on the same EEG feature vectors.
 """
 from __future__ import annotations
 
@@ -59,7 +59,7 @@ class TrialPlan:
 @dataclass
 class Prediction:
     label: int
-    probability: float  # calibrated P(label 1) for SVMs
+    probability: float  # P(label 1); sigmoid-calibrated for SVMs, native for others
     correct: bool
 
 
@@ -121,9 +121,20 @@ class MultiTrainer:
     def any_fitted(self) -> bool:
         return any(t.model is not None for t in self.models.values())
 
-    def save(self, stem: Path, metadata: dict) -> list[Path]:
+    def save(self, stem: Path, metadata: dict,
+             selected_models: set[tuple[str, str]] | None = None) -> list[Path]:
         if not self.any_fitted:
             raise ValueError(f"At least {MIN_TRIALS} usable EEG trials with both labels are needed to save a fitted model.")
+        selected = {key for key, trainer in self.models.items() if trainer.model is not None} \
+            if selected_models is None else set(selected_models)
+        if not selected:
+            raise ValueError("Select at least one fitted model to save.")
+        unknown = selected - self.models.keys()
+        if unknown:
+            raise ValueError(f"Unknown model selection: {sorted(unknown)}")
+        unfitted = {key for key in selected if self.models[key].model is None}
+        if unfitted:
+            raise ValueError(f"Selected models are not fitted: {sorted(unfitted)}")
         written = []
         summary = {}
         for (target, clf), trainer in self.models.items():
@@ -131,15 +142,17 @@ class MultiTrainer:
                      "probability_method": "3-fold cross-validated sigmoid calibration" if classifiers.needs_calibration(clf) else "native",
                      "n_eeg_trials": len(trainer.x),
                      "n_predictions": len(trainer.predictions), "rolling_accuracy": trainer.rolling_accuracy,
+                     "selected_for_save": (target, clf) in selected,
                      "model_file": None}
-            if trainer.model is not None:
+            if (target, clf) in selected:
                 path = stem.with_name(f"{stem.name}.{target}.{clf}.joblib")
                 joblib.dump(trainer.model, path)
                 entry["model_file"] = path.name
                 written.append(path)
             summary[f"{target}/{clf}"] = entry
         metadata_path = stem.with_suffix(".json")
-        record = {**metadata, "schema": 3, "models": summary}
+        record = {**metadata, "schema": 4, "saved_models": [f"{t}/{c}" for t, c in sorted(selected)],
+                  "models": summary}
         metadata_path.write_text(json.dumps(record, indent=2, default=str), encoding="utf-8")
         return [metadata_path, *written]
 

@@ -1,5 +1,6 @@
 import copy
 import csv
+import json
 import random
 from pathlib import Path
 
@@ -169,6 +170,39 @@ def test_separate_models_per_target_and_classifier(tmp_path, classifiers):
     saved_probability = predict_saved(model_path, probe)
     assert .5 < saved_probability < 1
     assert np.isclose(saved_probability, trainer.models[("valence", classifiers[0])].model.predict_proba(probe[None, :])[0, 1])
+
+
+def test_forest_prequential_probabilities_and_selective_save(tmp_path):
+    rng = np.random.default_rng(7)
+    trainer = MultiTrainer(["valence"], ["logreg", "svm", "forest"], 20)
+    for number in range(36):
+        label = number % 2
+        features = rng.normal(0, .4, 20)
+        features[0] += 2 * label
+        predictions = trainer.add(features, {"valence": label})
+        for key, prediction in predictions.items():
+            assert len(trainer.models[key].x) == number + 1
+            assert 0 <= prediction.probability <= 1
+            assert prediction.label == int(prediction.probability >= .5)
+    assert trainer.models[("valence", "forest")].model is not None
+    selection = {("valence", "forest")}
+    written = trainer.save(tmp_path / "run", {"participant": "test"}, selection)
+    assert {path.name for path in written} == {"run.json", "run.valence.forest.joblib"}
+    manifest = json.loads((tmp_path / "run.json").read_text(encoding="utf-8"))
+    assert manifest["saved_models"] == ["valence/forest"]
+    assert manifest["models"]["valence/forest"]["selected_for_save"] is True
+    assert manifest["models"]["valence/logreg"]["model_file"] is None
+    assert manifest["models"]["valence/svm"]["model_file"] is None
+    probe = np.zeros(20)
+    probability = predict_saved(tmp_path / "run.valence.forest.joblib", probe)
+    assert 0 <= probability <= 1
+    assert np.isclose(probability, trainer.models[("valence", "forest")].model.predict_proba(probe[None, :])[0, 1])
+    with pytest.raises(ValueError, match="Select at least one"):
+        trainer.save(tmp_path / "empty", {}, set())
+    with pytest.raises(ValueError, match="Unknown model"):
+        trainer.save(tmp_path / "unknown", {}, {("valence", "missing")})
+    assert not (tmp_path / "empty.json").exists()
+    assert not (tmp_path / "unknown.json").exists()
 
 
 def test_bursty_frame_arrivals_preserve_a_complete_epoch(monkeypatch):

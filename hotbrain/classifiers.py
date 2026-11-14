@@ -15,6 +15,7 @@ from sklearn.calibration import CalibratedClassifierCV
 from sklearn.linear_model import LogisticRegression
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
+from sklearn.ensemble import RandomForestClassifier
 from sklearn.svm import SVC
 
 
@@ -63,3 +64,8 @@ register_classifier("svm", "SVM (RBF kernel)",
                     lambda: SVC(kernel="rbf", C=1.0, gamma="scale"))
 register_classifier("svm_linear", "SVM (linear kernel)",
                     lambda: SVC(kernel="linear", C=1.0))
+register_classifier("forest", "Random forest (shallow)",
+                    lambda: RandomForestClassifier(
+                        n_estimators=48, max_depth=4, min_samples_leaf=4,
+                        max_features="sqrt", class_weight="balanced_subsample",
+                        random_state=41, n_jobs=1))

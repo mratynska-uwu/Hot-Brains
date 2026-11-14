@@ -58,7 +58,7 @@ CONFIG: dict[str, Any] = {
         "arousal": {"column": "arousal", "threshold": "median", "classes": ["low", "high"]},
     },
     # Keys from hotbrain.classifiers.CLASSIFIERS selected by default in the GUI.
-    "classifiers": ["logreg", "svm"],
+    "classifiers": ["logreg", "svm", "forest"],
 }
 
 
