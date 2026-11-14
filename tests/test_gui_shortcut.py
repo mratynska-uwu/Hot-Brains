@@ -122,7 +122,7 @@ def test_chosen_key_stops_from_presentation_window(tmp_path: Path, monkeypatch):
         assert window.training.fixation_min.value() == 2.0
         assert window.training.fixation_max.value() == 3.0
         assert "+2700 ms" in window.presentation.note.text()
-        assert window.training.selected_model_pairs() == [("valence", "logreg")]
+        assert window.training.selected_model_pairs() == [("valence", "svm")]
         for index, box in enumerate(window.training.electrode_boxes):
             box.setChecked(index in (0, 2, 7))
         features = window.target_features
@@ -131,13 +131,13 @@ def test_chosen_key_stops_from_presentation_window(tmp_path: Path, monkeypatch):
         # configuration 1 on Fz, Cz, PO8: 3 x 4 bands + 3 fractal dims (no complete asymmetry pair) / + 3 beta/alpha
         assert features.n_features() == {"valence": 15, "arousal": 18}
         assert len(window.features.quality_labels) == 8
-        for key in ("svm", "forest"):
+        for key in ("logreg", "forest"):
             window.training.train_boxes[("valence", key)].setChecked(True)
         assert not window.training.train_boxes[("valence", "svm_linear")].isEnabled()
         window.training.train_boxes[("valence", "forest")].setChecked(False)
         assert window.training.train_boxes[("valence", "svm_linear")].isEnabled()
-        window.training.train_boxes[("valence", "svm")].setChecked(False)
-        assert window.training.selected_model_pairs() == [("valence", "logreg")]
+        window.training.train_boxes[("valence", "logreg")].setChecked(False)
+        assert window.training.selected_model_pairs() == [("valence", "svm")]
         assert len(window.features.quality_map.POSITIONS) == 8
         assert all(rating.good is None for rating in window.features.quality_map.ratings)
         assert not window.features.quality_map.grab().isNull()

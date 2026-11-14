@@ -302,6 +302,10 @@ class TrainingPanel(QWidget):
         for button in (self.start, self.stop, self.save, self.discard):
             buttons.addWidget(button)
         layout.addLayout(buttons)
+        self.start_hint = QLabel("")
+        self.start_hint.setWordWrap(True)
+        self.start_hint.setStyleSheet("color: #c0392b;")
+        layout.addWidget(self.start_hint)
         self.stop_hint = QLabel("Press Escape in any app window to stop training.")
         self.stop_key.currentTextChanged.connect(
             lambda key: self.stop_hint.setText(f"Press {key} in any app window to stop training."))
@@ -1137,10 +1141,14 @@ class MainWindow(QMainWindow):
             self.training.image_seconds.setValue(minimum)
             image_ms = round(minimum * 1000)
         self.epoch_spec = self.target_features.epoch_spec(image_ms)
+        had_models = bool(self.eval_models)
         self.eval_models = {}
         self.eval_info = {}
         self.training.feedback_classifier.clear()
-        self.training.models_status.setText("Feature configuration changed. Load matching models or train again.")
+        self.training.models_status.setText(
+            f"Configuration {self.profile_number}: previous models no longer match and were unloaded. "
+            "Start a Training session, or load models saved with this configuration."
+            if had_models else "No trained models yet.")
         self._describe_features()
         self.update_timing_note()
         self._refresh_validation_availability()
@@ -1177,8 +1185,12 @@ class MainWindow(QMainWindow):
         self.model_channel_indices = positions
         self._rebuild_features()
 
+    def _usable_pairs(self, pairs: list[tuple[str, str]]) -> list[tuple[str, str]]:
+        """Selected pairs whose target has features in the current configuration and electrodes."""
+        return [pair for pair in pairs if pair[0] in self.target_features.targets]
+
     def _features_ready(self, pairs: list[tuple[str, str]]) -> bool:
-        return bool(pairs) and all(target in self.target_features.targets for target, _ in pairs)
+        return bool(self._usable_pairs(pairs))
 
     def update_timing_note(self):
         try:
@@ -1249,10 +1261,39 @@ class MainWindow(QMainWindow):
             valid = bool(self.eval_models)
         else:
             valid = True
-        self.training.start.setEnabled(
-            self.ready_for_new_run and not self.active and not self.finishing and valid
-            and bool(self.training.selected_electrode_positions())
-            and self.device.stream_ready())
+        electrodes = bool(self.training.selected_electrode_positions())
+        stream = self.device.stream_ready()
+        enabled = self.ready_for_new_run and not self.active and not self.finishing and valid and electrodes and stream
+        self.training.start.setEnabled(enabled)
+        self.training.start_hint.setText("" if enabled or self.active or self.finishing
+                                         else "Start disabled: " + self._start_blocker(session, pairs, valid,
+                                                                                       electrodes, stream))
+
+    def _start_blocker(self, session, pairs, valid, electrodes, stream) -> str:
+        """Plain-language reason why the Start button is disabled."""
+        if not self.ready_for_new_run:
+            return "save or discard the previous run first."
+        if not electrodes:
+            return "select at least one model electrode."
+        if not stream:
+            return "waiting for a live EEG stream from the headset."
+        if valid:
+            return "unknown reason."
+        if session in (SESSION_TRAINING, SESSION_CALIBRATION):
+            if not pairs:
+                return "tick at least one target/model pair."
+            if not self._features_ready(pairs):
+                missing = ", ".join(sorted({t for t, _ in pairs}))
+                return (f"configuration {self.profile_number} has no features for {missing} with the selected "
+                        "electrodes. Tick that target's electrodes or another target.")
+            if session == SESSION_TRAINING:
+                return "no valid evaluation mode for this trial count (see the evaluation note)."
+            return "no usable image dataset."
+        if session == SESSION_VALIDATION:
+            return "Validation needs split-mode models trained in this configuration. Switch the session to Training."
+        if session == SESSION_TEST:
+            return "Test needs trained or loaded models for this configuration. Switch the session to Training."
+        return "unknown reason."
 
     def ensure_eeg_stream(self) -> bool:
         if self.device.stream_live():
@@ -1410,11 +1451,14 @@ class MainWindow(QMainWindow):
             if not model_pairs:
                 QMessageBox.warning(self, "Models", "Select at least one target and model.")
                 return
-            missing = sorted({t for t, _ in model_pairs if t not in self.target_features.targets})
-            if missing:
+            usable = self._usable_pairs(model_pairs)
+            if not usable:
+                missing = sorted({t for t, _ in model_pairs})
                 QMessageBox.warning(self, "Features", f"Configuration {self.profile_number} has no features for "
                                     f"{', '.join(missing)} with the selected electrodes.")
                 return
+            # Train what this configuration supports; skip targets whose electrodes are not selected.
+            model_pairs = usable
         if session in (SESSION_VALIDATION, SESSION_TEST):
             if not self.eval_models:
                 QMessageBox.warning(self, "Models", "Run a training session first or load saved models.")

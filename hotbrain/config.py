@@ -143,7 +143,7 @@ CONFIG: dict[str, Any] = {
                     "exclude_middle": 1 / 3},
     },
     # Keys from hotbrain.classifiers.CLASSIFIERS selected by default in the GUI.
-    "classifiers": ["logreg"],
+    "classifiers": ["svm"],
 }
 
 
@@ -429,7 +429,7 @@ class AppConfig:
         balance_by = d.get("balance_by")
         if balance_by is not None and balance_by not in {t.name for t in targets}:
             raise ValueError(f"balance_by must be a target name or None, got {balance_by!r}")
-        classifiers = tuple(d.get("classifiers", ("logreg",)))
+        classifiers = tuple(d.get("classifiers", ("svm",)))
         unknown = [c for c in classifiers if c not in CLASSIFIERS]
         if unknown:
             raise ValueError(f"Unknown classifiers {unknown}; available: {sorted(CLASSIFIERS)}")
