@@ -32,7 +32,7 @@ def test_config_matches_basic_info():
 
 def test_target_formula_from_weighted_columns():
     from hotbrain.config import TargetSpec
-    spec = TargetSpec.from_dict("valence", CONFIG["targets"]["valence"])
+    spec = TargetSpec.from_dict("valence", {"columns": {"positive_mean": 1, "negative_mean": -1}})
     assert spec.formula == "positive_mean - negative_mean"
     assert spec.value({"positive_mean": "6", "negative_mean": "1.5"}) == 4.5
     with pytest.raises(ValueError, match="exactly one"):
@@ -58,6 +58,10 @@ def test_real_dataset_loads_with_valence_and_arousal_labels():
     assert np.isclose(first.values["valence"], float(row["positive_mean"]) - float(row["negative_mean"]))
     assert np.isclose(first.values["arousal"], float(row["aroused_mean"]))
     arousal = [i.labels["arousal"] for i in joy + sad]
+    for name in ("joy", "sadness", "records"):
+        for r in csv.DictReader(open(ROOT / f"data/training/{name}.csv", encoding="utf-8")):
+            assert np.isclose(float(r["valence"]), float(r["positive_mean"]) - float(r["negative_mean"]))
+            assert r["arousal"] == r["aroused_mean"]
     assert 0 < sum(arousal) < len(arousal)
     assert dataset.thresholds["arousal"] is not None
 
@@ -66,10 +70,10 @@ def _write_dataset(root: Path, rows: dict[str, list[tuple[str, int, float]]]):
     for folder, items in rows.items():
         path = root / "data" / folder
         path.mkdir(parents=True)
-        lines = ["image_name,is_positive,positive_mean,negative_mean,aroused_mean"]
+        lines = ["image_name,is_positive,valence,arousal"]
         for name, positive, aroused in items:
             (path / name).write_bytes(b"x")
-            lines.append(f"{name},{positive},{5 if positive else 2},{2 if positive else 5},{aroused}")
+            lines.append(f"{name},{positive},{3 if positive else -3},{aroused}")
         path.with_suffix(".csv").write_text("\n".join(lines), encoding="utf-8")
 
 

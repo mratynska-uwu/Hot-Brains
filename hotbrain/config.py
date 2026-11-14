@@ -49,11 +49,13 @@ CONFIG: dict[str, Any] = {
     # already 0/1; a number or "median" means label 1 = value above the
     # threshold (median of the loaded dataset). Swap these for any other
     # columns (e.g. approach_mean).
+    # The CSVs carry ready-made columns: valence = positive_mean - negative_mean
+    # (> 0 means rated more positive than negative) and arousal = aroused_mean.
+    # A dataset without them could use {"columns": {"positive_mean": 1,
+    # "negative_mean": -1}} instead.
     "targets": {
-        # valence = positive_mean - negative_mean; > 0 means rated more positive than negative
-        "valence": {"columns": {"positive_mean": 1, "negative_mean": -1}, "threshold": 0,
-                    "classes": ["negative", "positive"]},
-        "arousal": {"column": "aroused_mean", "threshold": "median", "classes": ["low", "high"]},
+        "valence": {"column": "valence", "threshold": 0, "classes": ["negative", "positive"]},
+        "arousal": {"column": "arousal", "threshold": "median", "classes": ["low", "high"]},
     },
     # Keys from hotbrain.classifiers.CLASSIFIERS selected by default in the GUI.
     "classifiers": ["logreg", "svm"],

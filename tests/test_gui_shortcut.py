@@ -39,10 +39,10 @@ def test_chosen_key_stops_from_detached_presentation(tmp_path: Path, monkeypatch
     for folder_name, positive, aroused in (("set/happy", 1, (1.0, 3.0)), ("set/sad", 0, (2.0, 4.0))):
         folder = tmp_path / "data" / folder_name
         folder.mkdir(parents=True)
-        lines = ["image_name,positive_mean,negative_mean,aroused_mean"]
+        lines = ["image_name,valence,arousal"]
         for i, value in enumerate(aroused):
             assert QImage(12, 12, QImage.Format.Format_RGB32).save(str(folder / f"sample{i}.png"))
-            lines.append(f"sample{i}.png,{5 if positive else 2},{2 if positive else 5},{value}")
+            lines.append(f"sample{i}.png,{3 if positive else -3},{value}")
         folder.with_suffix(".csv").write_text("\n".join(lines), encoding="utf-8")
     config = copy.deepcopy(CONFIG)
     config["datasets"] = ["set/happy", "set/sad"]

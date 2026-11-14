@@ -28,8 +28,9 @@ Everything that differs between experiments lives in one dictionary, `CONFIG`. `
 
 Defaults:
 
-- **Valence** = `positive_mean − negative_mean`, so a positive value means the image was rated more positive than negative. The label is positive when valence > 0. In this dataset that matches the folders exactly: all joy images are positive and all sadness images negative.
-- **Arousal** = `aroused_mean`, labelled high when above the dataset median (2.35). In this dataset `is_arousing` is 1 for every image, so it cannot be used. Arousal and valence labels are correlated here (joy images are rated more aroused on average), so their accuracies are not independent.
+- The metadata CSVs (`joy.csv`, `sadness.csv`, `records.csv`) have ready-made `valence` and `arousal` columns, appended as the last two columns. The targets read these columns. To compare with another dataset, give its CSV the same two columns on the same definition. A dataset without them can use `"columns": {"positive_mean": 1, "negative_mean": -1}` instead.
+- **Valence** (column `valence`) = `positive_mean − negative_mean`, so a positive value means the image was rated more positive than negative. The label is positive when valence > 0. In this dataset that matches the folders exactly: all joy images are positive and all sadness images negative.
+- **Arousal** (column `arousal`) = `aroused_mean`, labelled high when above the dataset median (2.35). In this dataset `is_arousing` is 1 for every image, so it cannot be used. Arousal and valence labels are correlated here (joy images are rated more aroused on average), so their accuracies are not independent.
 - The continuous valence/arousal values are saved with the trial log and epochs, so you can relabel or run regression offline.
 - **`device_channels`**: `None` assumes the eight electrodes are on Unicorn channels 1–8 in the listed order. The Unicorn's stock order is Fz, C3, Cz, C4, Pz, PO7, Oz, PO8. If the wiring differs, list the channel index (0–7) for each electrode.
 - **Bandpass** is 1–48 Hz so that the gamma band (30–45 Hz) is kept. The 50 Hz notch stays on. If a configured band falls outside the bandpass, the app shows a warning.
@@ -98,6 +99,7 @@ What changed compared with the original happy/sad trainer:
   - bands are alpha, beta, gamma (previously theta, alpha, beta);
   - features are band power + Higuchi fractal dimension, 20 by default. Asymmetry and ERP features are optional.
 - **Targets**: separate valence (`positive_mean − negative_mean > 0`) and arousal (`aroused_mean` > median) classification. Each target is defined by one column or a weighted sum of columns, so other targets can be added.
+- **Data**: `valence` and `arousal` columns added to `data/training/*.csv` for easy comparison with other datasets. All original columns are unchanged.
 - **Classifiers**: a registry (`hotbrain/classifiers.py`) with logistic regression, RBF SVM and linear SVM. Every target × selected classifier is trained and evaluated test-before-train in parallel, and the GUI shows each one's rolling accuracy and linear weights.
 - **Trial plan**: trials are balanced across dataset folders, and the trial count must be a multiple of the number of folders.
 - **Saving**: one `.joblib` per model, a manifest with the full config, resolved thresholds and per-trial predictions, and epochs with labels and continuous target values.
