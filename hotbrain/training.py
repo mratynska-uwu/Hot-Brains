@@ -87,6 +87,7 @@ class OnlineTrainer:
         self.x: list[np.ndarray] = []
         self.y: list[int] = []            # labels (classifiers) or sign classes (regression, may be -1 = none)
         self.values: list[float] = []     # regression targets
+        self.tags: list = []              # trial identifiers of the learned examples (for reports)
         self.model = None
         self.predictions: list[Prediction] = []
 
@@ -111,7 +112,8 @@ class OnlineTrainer:
         correct = None if label is None else predicted == label
         return Prediction(predicted, probability, correct, label, predicted_value, value)
 
-    def learn(self, features: np.ndarray, label: int | None, value: float | None = None, refit: bool = True):
+    def learn(self, features: np.ndarray, label: int | None, value: float | None = None, refit: bool = True,
+              tag=None):
         """Train step: append the example and refit when enough data exists."""
         if self.regression:
             if value is None:
@@ -123,6 +125,7 @@ class OnlineTrainer:
                 return
             self.y.append(int(label))
         self.x.append(features)
+        self.tags.append(tag)
         if refit:
             self.refit()
 
@@ -139,15 +142,15 @@ class OnlineTrainer:
             model.fit(np.vstack(self.x), np.asarray(self.y))
             self.model = model
 
-    def add(self, features: np.ndarray, label: int | None, value: float | None = None) -> Prediction | None:
+    def add(self, features: np.ndarray, label: int | None, value: float | None = None, tag=None) -> Prediction | None:
         features = self._check(features)
         prediction = self.predict(features, label, value)
         if prediction is not None:
             self.predictions.append(prediction)
-        self.learn(features, label, value)
+        self.learn(features, label, value, tag=tag)
         return prediction
 
-    def add_batch(self, rows: list[tuple[np.ndarray, int | None, float | None]]) -> list[Prediction | None]:
+    def add_batch(self, rows: list[tuple[np.ndarray, int | None, float | None]], tag=None) -> list[Prediction | None]:
         """Predict every row with the current model first, then learn them all and refit once.
 
         Used for calibration blocks: windows of one block must not predict each other.
@@ -160,7 +163,7 @@ class OnlineTrainer:
                 self.predictions.append(prediction)
             predictions.append(prediction)
         for features, label, value in checked:
-            self.learn(features, label, value, refit=False)
+            self.learn(features, label, value, refit=False, tag=tag)
         self.refit()
         return predictions
 
@@ -205,24 +208,24 @@ class MultiTrainer:
         return features[target] if isinstance(features, dict) else features
 
     def add(self, features: np.ndarray | dict[str, np.ndarray], labels: dict[str, int | None],
-            values: dict[str, float] | None = None) -> dict[tuple[str, str], Prediction]:
+            values: dict[str, float] | None = None, tag=None) -> dict[tuple[str, str], Prediction]:
         """Test-before-train for every model. ``features`` may be one shared vector or one per target."""
         out = {}
         for (target, clf), trainer in self.models.items():
             prediction = trainer.add(self._for(features, target), labels.get(target),
-                                     None if values is None else values.get(target))
+                                     None if values is None else values.get(target), tag=tag)
             if prediction is not None:
                 out[(target, clf)] = prediction
         return out
 
-    def add_batch(self, rows: list[tuple[dict[str, np.ndarray], dict[str, int | None], dict[str, float] | None]]
-                  ) -> dict[tuple[str, str], list[Prediction]]:
+    def add_batch(self, rows: list[tuple[dict[str, np.ndarray], dict[str, int | None], dict[str, float] | None]],
+                  tag=None) -> dict[tuple[str, str], list[Prediction]]:
         """Block-wise test-before-train: all rows are predicted before any of them is learned."""
         out = {}
         for (target, clf), trainer in self.models.items():
             predictions = trainer.add_batch([(self._for(f, target), labels.get(target),
                                               None if values is None else values.get(target))
-                                             for f, labels, values in rows])
+                                             for f, labels, values in rows], tag=tag)
             kept = [p for p in predictions if p is not None]
             if kept:
                 out[(target, clf)] = kept

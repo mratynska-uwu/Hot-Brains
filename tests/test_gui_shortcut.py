@@ -125,8 +125,11 @@ def test_chosen_key_stops_from_presentation_window(tmp_path: Path, monkeypatch):
         assert window.training.selected_model_pairs() == [("valence", "logreg")]
         for index, box in enumerate(window.training.electrode_boxes):
             box.setChecked(index in (0, 2, 7))
-        assert window.extractor.eeg.electrodes == ("Fz", "Cz", "PO8")
-        assert window.extractor.eeg.device_channels == (0, 2, 7)
+        features = window.target_features
+        assert {t: e.eeg.electrodes for t, e in features.extractors.items()} ==             {"valence": ("Fz", "Cz", "PO8"), "arousal": ("Fz", "Cz", "PO8")}
+        assert features.channel_indices == {"valence": (0, 2, 7), "arousal": (0, 2, 7)}
+        # configuration 1 on Fz, Cz, PO8: 3 x 4 bands + 3 fractal dims (no complete asymmetry pair) / + 3 beta/alpha
+        assert features.n_features() == {"valence": 15, "arousal": 18}
         assert len(window.features.quality_labels) == 8
         for key in ("svm", "forest"):
             window.training.train_boxes[("valence", key)].setChecked(True)
@@ -181,7 +184,8 @@ def test_chosen_key_stops_from_presentation_window(tmp_path: Path, monkeypatch):
             assert window.training.settings_scroll.isHidden()
             assert window.training.accuracy.columnCount() == 6
             assert window.training.accuracy.rowCount() == (1 if key_name == "Escape" else 6)
-            assert all(model.n_features == 15 for model in window.trainer.models.values())
+            assert all(model.n_features == {"valence": 15, "arousal": 18}[target]
+                       for (target, _), model in window.trainer.models.items())
             assert window.run_metadata["classifiers"] == (["svm"] if key_name == "Escape" else ["logreg", "svm", "forest"])
             assert len(window.run_metadata["training_model_pairs"]) == (1 if key_name == "Escape" else 6)
             assert window.run_metadata["epoch_end_ms"] == 1700
@@ -236,14 +240,16 @@ def test_chosen_key_stops_from_presentation_window(tmp_path: Path, monkeypatch):
         window.training.oscar.setChecked(True)
         assert window.features.oscar_toggle.isChecked()
         assert window.device.oscar
-        trainer = MultiTrainer(["valence", "arousal"], ["logreg", "svm", "forest"],
-                               len(window.extractor.names))
+        sizes = window.target_features.n_features()
+        trainer = MultiTrainer(["valence", "arousal"], ["logreg", "svm", "forest"], sizes)
         for number in range(16):
-            features = np.zeros(len(window.extractor.names))
-            features[0] = number % 2
-            features[1] = (number // 2) % 2
+            features = {t: np.zeros(n) for t, n in sizes.items()}
+            features["valence"][0] = number % 2
+            features["arousal"][1] = (number // 2) % 2
             trainer.add(features, {"valence": number % 2, "arousal": (number // 2) % 2})
-        window.training.configure_models(list(trainer.models), window.extractor.names)
+        window.training.configure_models(list(trainer.models), window.target_features.names)
+        window.training.update_models(trainer)
+        assert window.training.weights.rowCount() == sizes["valence"] + sizes["arousal"]
         assert not window.training.save.isEnabled()
         assert not window.training.selected_save_models()
         window.training.prepare_save_selection(trainer)
@@ -256,7 +262,7 @@ def test_chosen_key_stops_from_presentation_window(tmp_path: Path, monkeypatch):
         assert not window.training.save.isEnabled()
         window.training.save_boxes[("valence", "forest")].setChecked(True)
         window.trainer = trainer
-        window.epochs = [np.zeros((window.epoch_spec.n_samples, len(window.extractor.channels)), dtype=np.float32)]
+        window.epochs = [np.zeros((window.epoch_spec.n_samples, len(window.config.eeg.electrodes)), dtype=np.float32)]
         window.epoch_trial_numbers = [1]
         window.epoch_labels = [{"valence": 1, "arousal": 0}]
         window.epoch_values = [{"valence": 1.0, "arousal": 0.0}]

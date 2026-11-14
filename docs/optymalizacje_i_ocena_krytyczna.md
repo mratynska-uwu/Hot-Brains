@@ -2,6 +2,40 @@
 
 Dokument zbiera wnioski z 9 prac z folderu `papers/`. Szczegółowe podsumowania są w [`docs/papers/`](papers/). Plik `s00521-024-10240-z (1).pdf` to bajtowy duplikat, więc pominęliśmy go. Stan projektu oceniamy na listopad 2026, po dodaniu sesji walidacyjnej i testowej.
 
+## Status decyzji zespołu (14.11.2026)
+
+Aktualnym celem jest **optymalizacja treningu**. Po przeglądzie dokumentu zespół podjął następujące decyzje:
+
+| Punkt | Decyzja | Realizacja w kodzie |
+|---|---|---|
+| 2.2.2 „Etykiety pochodzą z ocen tłumu” i #2 (samoocena SAM) | **odrzucone** | – |
+| #26 pomiar timingu fotodiodą | **odrzucone** | – |
+| #3 kontrola confoundu wizualnego | **wstrzymane** | – |
+| #20 RF / gradient boosting | **wstrzymane** | (random forest dodał wcześniej Szymon; boosting nie dodany) |
+| #1 test permutacyjny | przyjęte | raport po treningu: CV + `permutation_test_score`; walidacja: p-value permutacji etykiet |
+| #5 theta 4–8 Hz | przyjęte | `bands_hz.theta`, konfiguracja 1 |
+| #6 ablacja pasm | przyjęte | raport: CV bez każdego pasma i tylko z nim |
+| #7 kalibracja dla celu 2 | przyjęte | sesja **Calibration**: bloki 20 s, okna 2 s / krok 1 s, uczenie blokami; modele „stanu” sterują testem |
+| #8 dłuższe okno i silniejsze wygładzanie | przyjęte | test z modelami stanu dekoduje okna 2 s; `feedback.smoothing` 0,1 |
+| #9 odrzucanie epok ±150 µV | przyjęte | `eeg.artifact_max_abs_uv`, powody odrzuceń w raporcie |
+| #10 CAR | przyjęte | `eeg.reference: "car"` (domyślnie wyłączone) |
+| #11 selekcja cech i strojenie C w zagnieżdżonej CV | przyjęte | model `logreg_select` |
+| #12 Welch | przyjęte | `eeg.psd_method: "welch"` (domyślnie) |
+| #13 asymetria alfa i indeks β/α | przyjęte | rodziny `asymmetry` (valence) i `beta_alpha_ratio` (arousal) w konfiguracji 1 |
+| #14 Hjorth, Katz/Petrosian, wariancja | przyjęte | rodziny `hjorth`, `katz_fd`, `petrosian_fd`, `variance` (do włączenia w profilu) |
+| #15 `class_weight="balanced"` | przyjęte | logreg, SVM, SVM liniowy |
+| #16 środkowy tercyl arousal | przyjęte | `targets.arousal.exclude_middle = 1/3` |
+| #17 próg mediany tylko z treningu | przyjęte | progi liczone ze zbioru treningowego (`rethreshold`) |
+| #18 regresja dla płaszczyzny V-A | przyjęte | model `ridge` (wartość ciągła w [−1, 1]) |
+| #19 baseline −500…−200 ms | przyjęte | `profiles.*.baseline_ms` |
+| #21 podejrzane etykiety | przyjęte | raport: prawdopodobieństwo poza foldem < 0,2 (cleanlab, jeśli zainstalowany) |
+| #22 spoczynek z otwartymi oczami | przyjęte | sesja **Resting baseline** (90 s), zapis i mediana mocy pasm; normalizacja cech tym odniesieniem jeszcze nie jest stosowana |
+| #23 reguła zatrzymania | przyjęte | GUI **Stopping rule** (domyślnie 65% balanced accuracy z 40 predykcji) |
+| #24 czytelny feedback | przyjęte | kolor kropki zależny od odległości, sygnał dźwiękowy przy celu, próbna sesja testowa |
+| #4 cechy ERP, #25 logistyka | bez decyzji | rodzina `erp` dostępna w profilach |
+
+Dodatkowo, na prośbę zespołu, cechy są definiowane **osobno dla valence i arousal** w dwóch wybieralnych konfiguracjach. Konfiguracja 2 ma okno 450 ms; arousal korzysta w niej z alfy potylicznej (PO7, Oz, PO8), a valence z bety i gammy na elektrodach czołowych i centralnych (Fz, C3, Cz, C4). Po każdym treningu powstaje raport jakości z parametrami każdego modelu, osobno dla valence i arousal.
+
 ## 0. Cele projektu (punkt odniesienia)
 
 1. **Cel 1:** wytrenować klasyfikator valence–arousal dla danego uczestnika na 80% zbioru treningowego i sprawdzić go na pozostałych 20%.

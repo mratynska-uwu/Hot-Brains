@@ -27,19 +27,19 @@ def test_training_worker_keeps_gui_responsive_and_trials_ordered(tmp_path: Path,
     monkeypatch.setattr(gui, "DeviceManager", NoDevice)
     app = QApplication.instance() or QApplication([])
     window = MainWindow(tmp_path)
-    window.trainer = MultiTrainer(["valence"], ["logreg"], len(window.extractor.names))
-    window.training.configure_models(list(window.trainer.models), window.extractor.names)
+    window.trainer = MultiTrainer(["valence"], ["logreg"], window.target_features.n_features())
+    window.training.configure_models(list(window.trainer.models), window.target_features.names)
     window.shown = 2
     window.active = True
     main_thread = threading.get_ident()
     worker_threads = []
     painted = []
 
-    def slow_training(extractor, spec, trainer, epoch, labels):
+    def slow_training(features, spec, trainer, epoch, labels, values=None, tag=None):
         worker_threads.append(threading.get_ident())
         time.sleep(.15)
-        vector = np.full(len(window.extractor.names), epoch[0, 0])
-        return vector, trainer.add(vector, labels), 150.0
+        vectors = {"valence": np.full(features.n_features()["valence"], epoch[0, 0])}
+        return vectors, trainer.add(vectors, labels, values, tag=tag), 150.0
 
     monkeypatch.setattr(gui, "train_epoch", slow_training)
     for number, label in ((1, 0), (2, 1)):
@@ -154,7 +154,7 @@ def test_validation_uses_frozen_models_when_no_training_pairs_are_selected(tmp_p
             time.sleep(.01)
         assert window.training_future is None
         assert window.trial_log[0]["eeg"] == "usable"
-        assert len(window.extractor.names) == 15
+        assert window.target_features.n_features()["valence"] == 15
         assert window.validation.accuracy(("valence", "logreg"))[2] == 1
         assert window.run_metadata["training_model_pairs"] == []
     finally:

@@ -23,6 +23,8 @@ from .dataset import Dataset, StimulusImage
 SESSION_TRAINING = "training"
 SESSION_VALIDATION = "validation"
 SESSION_TEST = "test"
+SESSION_CALIBRATION = "calibration"   # goal 2: hold the image's emotion; models learn sliding windows
+SESSION_RESTING = "resting"           # eyes-open resting reference recording
 
 
 def split_dataset(dataset: Dataset, validation_fraction: float, seed: int
@@ -58,14 +60,34 @@ class OncePlan:
         return self.items[self.index - 1]
 
 
-def affect_point(models: dict[tuple[str, str], object], classifier: str, features: np.ndarray,
+def _vector(features, target: str):
+    return features.get(target) if isinstance(features, dict) else features
+
+
+def affect_point(models: dict[tuple[str, str], object], classifier: str, features,
                  targets: tuple[str, str]) -> tuple[float | None, float | None]:
-    """Decoded (x, y) in [-1, 1]: 2 * P(label 1) - 1 for the two displayed targets."""
+    """Decoded (x, y) in [-1, 1]: 2 * P(label 1) - 1 for the two displayed targets.
+
+    ``features`` is one vector per target (dict) or a single shared vector.
+    """
     out = []
     for target in targets:
         model = models.get((target, classifier))
-        out.append(None if model is None else 2 * probability_class1(model, features) - 1)
+        vector = _vector(features, target)
+        out.append(None if model is None or vector is None else 2 * probability_class1(model, vector) - 1)
     return out[0], out[1]
+
+
+def calibration_images(groups: dict[str, list[StimulusImage]], scores: dict[str, float],
+                       per_group: int) -> dict[str, list[StimulusImage]]:
+    """The ``per_group`` most clear-cut images of each group (largest emotional score) for calibration blocks."""
+    return {g: sorted(items, key=lambda i: -scores[str(i.path)])[:per_group] for g, items in groups.items()}
+
+
+def sliding_windows(segment: np.ndarray, fs: int, skip_s: float, window_s: float, step_s: float) -> list[np.ndarray]:
+    """Windows of a calibration block, starting ``skip_s`` after onset."""
+    width, step, start = round(window_s * fs), round(step_s * fs), round(skip_s * fs)
+    return [segment[i:i + width] for i in range(start, len(segment) - width + 1, step)]
 
 
 @dataclass
@@ -74,14 +96,36 @@ class ValidationScores:
     models: dict[tuple[str, str], object]
     records: dict[tuple[str, str], list[tuple[int, int, float]]] = field(default_factory=dict)
 
-    def add(self, features: np.ndarray, labels: dict[str, int]) -> dict[tuple[str, str], tuple[int, float]]:
+    def add(self, features, labels: dict[str, int | None]) -> dict[tuple[str, str], tuple[int, float]]:
+        """Score one image. ``features`` is one vector per target (dict) or a shared vector.
+        Images without a label for a target (excluded middle) are predicted but not scored."""
         out = {}
         for (target, clf), model in self.models.items():
-            p = probability_class1(model, features)
-            predicted = int(model.predict(np.asarray(features, dtype=np.float64)[None, :])[0])
-            self.records.setdefault((target, clf), []).append((labels[target], predicted, p))
+            vector = _vector(features, target)
+            if vector is None:
+                continue
+            p = probability_class1(model, vector)
+            predicted = int(model.predict(np.asarray(vector, dtype=np.float64)[None, :])[0])
+            if labels.get(target) is not None:
+                self.records.setdefault((target, clf), []).append((labels[target], predicted, p))
             out[(target, clf)] = (predicted, p)
         return out
+
+    def permutation_p(self, key: tuple[str, str], n: int = 2000, seed: int = 0) -> float | None:
+        """P-value of the balanced accuracy against shuffled labels (predictions held fixed)."""
+        rows = self.records.get(key, [])
+        truth = np.array([r[0] for r in rows])
+        predicted = np.array([r[1] for r in rows])
+        if len(rows) < 4 or len(set(truth)) < 2:
+            return None
+
+        def balanced(t):
+            return np.mean([np.mean(predicted[t == c] == c) for c in (0, 1)])
+
+        observed = balanced(truth)
+        rng = np.random.default_rng(seed)
+        hits = sum(balanced(rng.permutation(truth)) >= observed for _ in range(n))
+        return float((hits + 1) / (n + 1))
 
     def accuracy(self, key: tuple[str, str]) -> tuple[float | None, float | None, int]:
         """(accuracy %, balanced accuracy %, n). Balanced = mean recall of the classes present."""

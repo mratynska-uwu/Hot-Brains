@@ -26,6 +26,7 @@ class AffectPlane(QWidget):
         self.decoded: tuple[float, float] | None = None
         self.trail: deque[tuple[float, float]] = deque(maxlen=40)
         self.caption = ""
+        self.on_target_distance = 0.35
         self.setMinimumSize(300, 330)
 
     def set_axes(self, x_name: str, y_name: str):
@@ -44,6 +45,24 @@ class AffectPlane(QWidget):
             if keep_trail:
                 self.trail.append(self.decoded)
         self.update()
+
+    def distance(self) -> float | None:
+        if self.target is None or self.decoded is None:
+            return None
+        return float(((self.target[0] - self.decoded[0]) ** 2 + (self.target[1] - self.decoded[1]) ** 2) ** .5)
+
+    def on_target(self) -> bool:
+        distance = self.distance()
+        return distance is not None and distance < self.on_target_distance
+
+    def decoded_color(self) -> str:
+        """Green on target, yellow when close, red when far; neutral without a target."""
+        distance = self.distance()
+        if distance is None:
+            return DECODED_COLOR
+        if distance < self.on_target_distance:
+            return "#3ddc84"
+        return "#f4e06d" if distance < 2 * self.on_target_distance else "#ff727a"
 
     def set_caption(self, text: str):
         self.caption = text
@@ -106,8 +125,8 @@ class AffectPlane(QWidget):
             painter.drawLine(center + QPointF(0, -8), center + QPointF(0, 8))
         if self.decoded is not None:
             painter.setPen(QPen(QColor("#0b1a2a"), 3))
-            painter.setBrush(QColor(DECODED_COLOR))
-            painter.drawEllipse(self._to_px(square, self.decoded), 11, 11)
+            painter.setBrush(QColor(self.decoded_color()))
+            painter.drawEllipse(self._to_px(square, self.decoded), 16, 16)
 
         painter.setFont(QFont("Arial", 11, QFont.Weight.DemiBold))
         y = square.bottom() + 24
