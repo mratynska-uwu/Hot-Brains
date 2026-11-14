@@ -1,7 +1,7 @@
 """Trial allocation and prequential (test-before-train) classifiers.
 
 One model is trained per (target, classifier) pair, e.g. valence/logreg,
-valence/svm, arousal/logreg, arousal/svm, all on the same EEG feature vectors.
+valence/forest and arousal/svm, all on the same EEG feature vectors.
 """
 from __future__ import annotations
 
@@ -59,7 +59,7 @@ class TrialPlan:
 @dataclass
 class Prediction:
     label: int
-    probability: float | None  # P(label 1), when the classifier provides it
+    probability: float  # P(label 1); sigmoid-calibrated for SVMs, native for others
     correct: bool
 
 
@@ -80,15 +80,15 @@ class OnlineTrainer:
             raise ValueError("Invalid EEG feature vector")
         prediction = None
         if self.model is not None:
-            predicted = int(self.model.predict(features[None, :])[0])
-            probability = None
-            if hasattr(self.model, "predict_proba"):
-                probability = float(self.model.predict_proba(features[None, :])[0, 1])
+            probability = float(self.model.predict_proba(features[None, :])[0, 1])
+            predicted = int(probability >= .5)
             prediction = Prediction(predicted, probability, predicted == label)
             self.predictions.append(prediction)
         self.x.append(features)
         self.y.append(int(label))
-        if len(self.x) >= MIN_TRIALS and len(set(self.y)) == 2 and min(self.y.count(0), self.y.count(1)) >= 2:
+        minimum_per_class = 3 if classifiers.needs_calibration(self.classifier) else 2
+        if len(self.x) >= MIN_TRIALS and len(set(self.y)) == 2 \
+                and min(self.y.count(0), self.y.count(1)) >= minimum_per_class:
             model = classifiers.build(self.classifier)
             model.fit(np.vstack(self.x), np.asarray(self.y))
             self.model = model
@@ -121,34 +121,49 @@ class MultiTrainer:
     def any_fitted(self) -> bool:
         return any(t.model is not None for t in self.models.values())
 
-    def save(self, stem: Path, metadata: dict) -> list[Path]:
+    def save(self, stem: Path, metadata: dict,
+             selected_models: set[tuple[str, str]] | None = None) -> list[Path]:
         if not self.any_fitted:
             raise ValueError(f"At least {MIN_TRIALS} usable EEG trials with both labels are needed to save a fitted model.")
+        selected = {key for key, trainer in self.models.items() if trainer.model is not None} \
+            if selected_models is None else set(selected_models)
+        if not selected:
+            raise ValueError("Select at least one fitted model to save.")
+        unknown = selected - self.models.keys()
+        if unknown:
+            raise ValueError(f"Unknown model selection: {sorted(unknown)}")
+        unfitted = {key for key in selected if self.models[key].model is None}
+        if unfitted:
+            raise ValueError(f"Selected models are not fitted: {sorted(unfitted)}")
         written = []
         summary = {}
         for (target, clf), trainer in self.models.items():
-            entry = {"classifier": classifiers.CLASSIFIERS[clf].label, "n_eeg_trials": len(trainer.x),
+            entry = {"classifier": classifiers.CLASSIFIERS[clf].label,
+                     "probability_method": "3-fold cross-validated sigmoid calibration" if classifiers.needs_calibration(clf) else "native",
+                     "n_eeg_trials": len(trainer.x),
                      "n_predictions": len(trainer.predictions), "rolling_accuracy": trainer.rolling_accuracy,
+                     "selected_for_save": (target, clf) in selected,
                      "model_file": None}
-            if trainer.model is not None:
+            if (target, clf) in selected:
                 path = stem.with_name(f"{stem.name}.{target}.{clf}.joblib")
                 joblib.dump(trainer.model, path)
                 entry["model_file"] = path.name
                 written.append(path)
             summary[f"{target}/{clf}"] = entry
         metadata_path = stem.with_suffix(".json")
-        record = {**metadata, "schema": 2, "models": summary}
+        record = {**metadata, "schema": 4, "saved_models": [f"{t}/{c}" for t, c in sorted(selected)],
+                  "models": summary}
         metadata_path.write_text(json.dumps(record, indent=2, default=str), encoding="utf-8")
         return [metadata_path, *written]
 
 
 def predict_saved(model_path: Path, features: np.ndarray) -> float:
-    """P(label 1) from a saved model, or its 0/1 prediction if it has no probabilities (SVM).
+    """P(label 1) from a saved model, including calibrated SVMs.
 
     joblib uses pickle: only load files you created.
     """
     model = joblib.load(model_path)
     features = np.asarray(features, dtype=np.float64)[None, :]
-    if hasattr(model, "predict_proba"):
-        return float(model.predict_proba(features)[0, 1])
-    return float(model.predict(features)[0])
+    if not hasattr(model, "predict_proba"):
+        raise ValueError("This saved model has no probability output; retrain it with the current app.")
+    return float(model.predict_proba(features)[0, 1])

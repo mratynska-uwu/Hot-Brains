@@ -1,7 +1,17 @@
 """Simulated EEG source for testing the full pipeline without a headset.
 
+This is the one, explicitly opt-in exception to "the app never generates
+substitute EEG": it exists only for testing the GUI, sessions and classifiers,
+and every simulated run is labelled SIMULATED in the GUI, manifests and file
+names. It is never used unless the operator ticks "Simulate EEG" or starts the
+app with ``--simulate``.
+
 ``SimulatedDevice`` has the same interface as ``acquisition.DeviceManager``
-and streams 8 Unicorn-like channels in real time into the same ``SampleRing``.
+(``stream_ready``, ``readiness_issue``, ``mark_image``, ``ring`` ...). It streams
+8 Unicorn-like channels in real time into the same marker-aligned
+``SampleRing``; image markers are written into a marker column on the
+simulator's own sample grid at the Qt paint time, so epochs are cut exactly
+like with the real headset (without the Unicorn's 40 ms device delay).
 
 Background: low-frequency (AR(1)) noise + white noise + a 10 Hz alpha rhythm
 + 50 Hz mains hum, about 5-10 µV after filtering. Every image adds an ERP-like
@@ -22,6 +32,7 @@ from .acquisition import SampleRing
 from .config import EEGSettings
 
 DEVICE_CHANNELS = EEGSettings.UNICORN_CHANNELS
+MARKER_COLUMN = DEVICE_CHANNELS          # frames are 8 EEG columns + 1 marker column
 EFFECT_FREQUENCIES_HZ = (10.0, 20.0, 6.0, 30.0)
 TICK_MS = 40
 
@@ -39,12 +50,14 @@ class SimulatedDevice(QObject):
         self.oscar = False
         self.serial = None
         self.retention_s = 20.0
-        self.ring = SampleRing(self.retention_s, eeg.fs, eeg.device_channels)
+        self.ring = SampleRing(self.retention_s, eeg.fs, eeg.device_channels, device_delay_ms=0)
         self.connected = False
         self.rng = np.random.default_rng(seed)
         self.t0: float | None = None
         self.generated = 0
         self.stimuli: list[tuple[float, float, dict[str, int]]] = []
+        self._pending_markers: dict[int, int] = {}
+        self._next_marker = 0
         self._ar_state = np.zeros((1, DEVICE_CHANNELS))
         self._phase = self.rng.uniform(0, 2 * np.pi, DEVICE_CHANNELS)
         self._timer = QTimer(self)
@@ -60,6 +73,32 @@ class SimulatedDevice(QObject):
     def set_retention(self, seconds: float):
         self.retention_s = max(20.0, seconds)
         self.ring.retention_s = self.retention_s
+
+    def stream_ready(self, max_age_s: float = .25) -> bool:
+        # Samples are produced on the Qt timer, which pauses while the GUI does
+        # blocking work (loading images, saving models). Catch up first so the
+        # simulated stream is never stale just because the event loop was busy.
+        if self.connected and self.t0 is not None:
+            self.advance(time.perf_counter())
+        ring = self.ring
+        return (self.connected and ring.received_samples >= self.eeg.fs // 2
+                and 0 <= time.perf_counter() - ring.last_arrival <= max_age_s)
+
+    def readiness_issue(self) -> str:
+        if not self.connected:
+            return "simulation is not running"
+        if self.ring.received_samples < self.eeg.fs // 2:
+            return "waiting for the first half-second of simulated EEG"
+        if time.perf_counter() - self.ring.last_arrival > .25:
+            return "simulated EEG frames are stale"
+        return "ready"
+
+    def mark_image(self, paint_stamp: float) -> tuple[int, float]:
+        """Put the image onset on the simulator's sample grid; it has no marker transport delay."""
+        code = self.place_marker(paint_stamp)
+        if not self.stream_ready():
+            raise RuntimeError("simulated EEG stream is not ready")
+        return code, 0.0
 
     def close(self):
         self._timer.stop()
@@ -77,6 +116,18 @@ class SimulatedDevice(QObject):
         self.status_changed.emit(f"Simulated EEG · {self.eeg.fs} Hz · effect {self.effect_uv:g} µV "
                                  "(no headset; for testing only)")
 
+    def place_marker(self, stamp: float) -> int:
+        """Register a marker at the sample that corresponds to ``stamp``; returns its code."""
+        self._next_marker += 1
+        index = round((stamp - self.t0) * self.eeg.fs)
+        if index < self.generated:
+            # That sample was already streamed: record the marker at its exact index.
+            with self.ring._lock:
+                self.ring._markers[self._next_marker] = index
+        else:
+            self._pending_markers[index] = self._next_marker
+        return self._next_marker
+
     def mark_stimulus(self, onset: float, duration_s: float, labels: dict[str, int]):
         """Called at image onset so the image's labels can shape the coming samples."""
         self.stimuli.append((onset, onset + duration_s, dict(labels)))
@@ -92,11 +143,14 @@ class SimulatedDevice(QObject):
         n = total - self.generated
         if n <= 0:
             return
-        times = self.t0 + (self.generated + np.arange(1, n + 1)) / self.eeg.fs
-        block = self._generate(times)
+        indices = self.generated + np.arange(n)
+        times = self.t0 + indices / self.eeg.fs
+        frame = np.zeros((n, DEVICE_CHANNELS + 1))
+        frame[:, :DEVICE_CHANNELS] = self._generate(times)
+        for index in [i for i in self._pending_markers if i < total]:
+            frame[index - self.generated, MARKER_COLUMN] = self._pending_markers.pop(index)
         self.generated = total
-        # The ring anchors its first block to "now - delay"; samples here end at times[-1].
-        self.ring.append(block, time.perf_counter() - times[-1])
+        self.ring.append(frame, marker_channel=MARKER_COLUMN)
         horizon = times[-1] - self.retention_s
         self.stimuli = [s for s in self.stimuli if s[1] + 1.0 >= horizon]
 
