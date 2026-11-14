@@ -76,23 +76,50 @@ def test_config_rejects_unknown_electrode_in_region():
 
 
 def test_real_dataset_loads_with_valence_and_arousal_labels():
+    """data/training/images + data/training/records.csv, trials balanced by valence class."""
     dataset = load_dataset(AppConfig.from_dict(CONFIG, ROOT))
-    assert set(dataset.groups) == {"training/joy", "training/sadness"}
-    joy, sad = dataset.groups["training/joy"], dataset.groups["training/sadness"]
-    assert len(joy) == 143 and len(sad) == 74
-    assert all(i.labels["valence"] == 1 for i in joy) and all(i.labels["valence"] == 0 for i in sad)
-    first = joy[0]
-    row = next(r for r in csv.DictReader(open(ROOT / "data/training/joy.csv", encoding="utf-8"))
-               if r["image_name"] == first.path.name)
-    assert np.isclose(first.values["valence"], float(row["positive_mean"]) - float(row["negative_mean"]))
-    assert np.isclose(first.values["arousal"], float(row["aroused_mean"]))
-    arousal = [i.labels["arousal"] for i in joy + sad]
-    for name in ("joy", "sadness", "records"):
-        for r in csv.DictReader(open(ROOT / f"data/training/{name}.csv", encoding="utf-8")):
-            assert np.isclose(float(r["valence"]), float(r["positive_mean"]) - float(r["negative_mean"]))
-            assert r["arousal"] == r["aroused_mean"]
+    assert set(dataset.groups) == {"valence=negative", "valence=positive"}
+    negative, positive = dataset.groups["valence=negative"], dataset.groups["valence=positive"]
+    assert len(negative) + len(positive) == len(list((ROOT / "data/training/images").iterdir()))
+    assert all(i.labels["valence"] == 0 for i in negative) and all(i.labels["valence"] == 1 for i in positive)
+    assert all(i.path.parent.name == "images" for i in negative + positive)
+    rows = {r["image_name"]: r for r in csv.DictReader(open(ROOT / "data/training/records.csv", encoding="utf-8"))}
+    for r in rows.values():
+        assert np.isclose(float(r["valence"]), float(r["positive_mean"]) - float(r["negative_mean"]))
+        assert r["arousal"] == r["aroused_mean"]
+    first = positive[0]
+    assert np.isclose(first.values["valence"], float(rows[first.path.name]["valence"]))
+    assert np.isclose(first.values["arousal"], float(rows[first.path.name]["arousal"]))
+    # CSV rows whose image file is absent are skipped and reported, not fatal.
+    assert dataset.rows_without_image == sorted(set(rows) - {i.path.name for i in negative + positive})
+    arousal = [i.labels["arousal"] for i in negative + positive]
     assert 0 < sum(arousal) < len(arousal)
     assert dataset.thresholds["arousal"] is not None
+
+
+def test_dataset_with_explicitly_named_metadata_csv(tmp_path):
+    folder = tmp_path / "data" / "set" / "images"
+    folder.mkdir(parents=True)
+    lines = ["image_name,valence,arousal"]
+    for name, valence, arousal in (("a.png", 2, 1.0), ("b.png", -2, 3.0), ("c.png", 1, 2.0)):
+        (folder / name).write_bytes(b"x")
+        lines.append(f"{name},{valence},{arousal}")
+    lines.append("missing.png,1,1.0")
+    (tmp_path / "data" / "set" / "records.csv").write_text("\n".join(lines), encoding="utf-8")
+    config = copy.deepcopy(CONFIG)
+    config["datasets"] = [{"images": "set/images", "metadata": "set/records.csv"}]
+    app_config = AppConfig.from_dict(config, tmp_path)
+    assert app_config.n_trial_groups == 2
+    dataset = load_dataset(app_config)
+    assert {g: sorted(i.path.name for i in v) for g, v in dataset.groups.items()} == \
+        {"valence=negative": ["b.png"], "valence=positive": ["a.png", "c.png"]}
+    assert dataset.rows_without_image == ["missing.png"]
+    config["balance_by"] = None
+    dataset = load_dataset(AppConfig.from_dict(config, tmp_path))
+    assert list(dataset.groups) == ["set/images"]
+    config["balance_by"] = "nonsense"
+    with pytest.raises(ValueError, match="balance_by"):
+        AppConfig.from_dict(config, tmp_path)
 
 
 def _write_dataset(root: Path, rows: dict[str, list[tuple[str, int, float]]]):
@@ -117,6 +144,7 @@ def test_dataset_folders_are_a_parameter_and_constant_targets_are_rejected(tmp_p
     assert {i.path.name: i.values["valence"] for g in dataset.groups.values() for i in g} == \
         {"p1.png": 3, "p2.png": 3, "n1.png": -3}
     config["targets"] = {"arousal": {"column": "is_positive", "threshold": None}}
+    config["balance_by"] = None
     config["datasets"] = ["a/pos"]
     with pytest.raises(ValueError, match="same label"):
         load_dataset(AppConfig.from_dict(config, tmp_path))

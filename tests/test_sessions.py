@@ -22,8 +22,9 @@ def dataset():
 
 def test_split_is_stratified_reproducible_and_disjoint(dataset):
     train, validation = split_dataset(dataset, 0.2, 42)
-    assert {g: len(v) for g, v in validation.items()} == {"training/joy": 29, "training/sadness": 15}
-    assert {g: len(v) for g, v in train.items()} == {"training/joy": 114, "training/sadness": 59}
+    for group, items in dataset.groups.items():   # stratified: 20% of each valence class
+        assert len(validation[group]) == round(len(items) * 0.2)
+        assert len(train[group]) == len(items) - len(validation[group])
     for group in dataset.groups:
         train_names = {i.path.name for i in train[group]}
         val_names = {i.path.name for i in validation[group]}
@@ -33,7 +34,7 @@ def test_split_is_stratified_reproducible_and_disjoint(dataset):
     assert {g: [i.path.name for i in v] for g, v in again.items()} == \
         {g: [i.path.name for i in v] for g, v in validation.items()}
     other = split_dataset(dataset, 0.2, 7)[1]
-    assert [i.path.name for i in other["training/joy"]] != [i.path.name for i in validation["training/joy"]]
+    assert [i.path.name for i in other["valence=positive"]] != [i.path.name for i in validation["valence=positive"]]
 
 
 def test_once_plan_shows_each_image_once(dataset):
@@ -41,15 +42,15 @@ def test_once_plan_shows_each_image_once(dataset):
     plan = OncePlan(validation, random.Random(1))
     shown = [plan.next() for _ in range(plan.total)]
     assert plan.next() is None
-    assert len({i.path for i in shown}) == plan.total == 44
+    assert len({i.path for i in shown}) == plan.total == sum(len(v) for v in validation.values())
 
 
 def test_normalized_targets_span_minus_one_to_one(dataset):
     values = [dataset.normalized("valence", i.values["valence"]) for i in dataset.images]
     assert min(values) == -1.0 or max(values) == 1.0
     assert all(-1 <= v <= 1 for v in values)
-    joy = dataset.groups["training/joy"][0]
-    assert dataset.normalized("valence", joy.values["valence"]) > 0
+    positive = dataset.groups["valence=positive"][0]
+    assert dataset.normalized("valence", positive.values["valence"]) > 0
 
 
 class _Fixed:

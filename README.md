@@ -17,13 +17,13 @@ Pick the session type in the **Session** selector of the training window. The im
 
 | Session | Images | Models | What you see |
 |---|---|---|---|
-| **Training** | the 80% training split; trials balanced across folders | learn after every trial (test-before-train) | rolling accuracy per target × classifier, linear weights |
+| **Training** | the 80% training split; trials balanced across the valence classes (`balance_by`) | learn after every trial (test-before-train) | rolling accuracy per target × classifier, linear weights |
 | **Validation** | the 20% validation split, each image once | frozen: from the last training run or **Load saved models…** | next to the image, a valence–arousal plane with the target ◯ and the EEG estimate ● for each image; a table of accuracy, balanced accuracy and majority-class baseline |
 | **Test** | `data/test` (each image once) | frozen | the image with its target ◯; the estimate ● updates continuously (every `feedback.update_s`, smoothed) with a trail and distance to the target |
 
 Details:
 
-- **Split.** The 80/20 split is stratified per folder and reproducible: `split.seed` in `CONFIG`, 114 + 59 training and 29 + 15 validation images. Validation images never appear in training.
+- **Split.** The 80/20 split is stratified by the `balance_by` groups (valence classes) and reproducible: `split.seed` in `CONFIG`. With the current data that is 146 + 306 training and 37 + 77 validation images (negative + positive valence). Validation images never appear in training.
 - **Plane coordinates.**
   - Target ◯: the image's rating, scaled to [−1, 1] around the class threshold. 0 is the class boundary; ±1 is the most extreme image in the training dataset.
   - EEG estimate ●: `2·P(class 1) − 1` from the classifier chosen in **Live display uses**. It is the classifier's confidence, not a calibrated rating.
@@ -77,7 +77,8 @@ Everything that differs between experiments lives in one dictionary, `CONFIG`. `
 
 | Key | Default | Meaning |
 |---|---|---|
-| `datasets` | `["training/joy", "training/sadness"]` | Subfolders of `data_dir` (`data/`). Each one needs a sibling CSV with the same name (`data/training/joy.csv`), one row per image. Trials are balanced across these folders. |
+| `datasets` | `[{"images": "training/images", "metadata": "training/records.csv"}]` | Image folders under `data_dir` (`data/`). An entry is either a folder with a same-named sibling CSV (`"sub/folder"` → `sub/folder.csv`) or a dict naming the folder and its CSV. The CSV needs one row per image; rows without an image file are skipped and reported. |
+| `balance_by` | `"valence"` | Training trials are balanced across this target's classes and the 80/20 split is stratified by them. `None` balances across the dataset folders instead. |
 | `image_column` | `image_name` | CSV column holding the file name. |
 | `eeg` | from `basic_info.md` | `sampling_rate` 250, `electrodes` Fz, C3, Cz, C4, P3, Pz, P4, Oz, `bandpass_hz` 1–48, `notch_hz` 50, `bands_hz` alpha/beta/gamma, `features` band power + fractal dimension. Also `regions`, `asymmetry_pairs`, `erp_windows_ms`, `fractal_kmax` and `device_channels`. |
 | `targets` | valence, arousal | Each target gets one value per image: a single CSV column (`"column": "aroused_mean"`) or a weighted sum of columns (`"columns": {"positive_mean": 1, "negative_mean": -1}`). The binary label comes from that value. With `threshold: None` the value must already be 0/1. A number or `"median"` makes label 1 mean the value is above the threshold. To analyse something else, add or replace entries (e.g. `approach_mean`). |
@@ -85,9 +86,9 @@ Everything that differs between experiments lives in one dictionary, `CONFIG`. `
 
 Defaults:
 
-- The metadata CSVs (`joy.csv`, `sadness.csv`, `records.csv`) have ready-made `valence` and `arousal` columns, appended as the last two columns. The targets read these columns. To compare with another dataset, give its CSV the same two columns on the same definition. A dataset without them can use `"columns": {"positive_mean": 1, "negative_mean": -1}` instead.
-- **Valence** (column `valence`) = `positive_mean − negative_mean`, so a positive value means the image was rated more positive than negative. The label is positive when valence > 0. In this dataset that matches the folders exactly: all joy images are positive and all sadness images negative.
-- **Arousal** (column `arousal`) = `aroused_mean`, labelled high when above the dataset median (2.35). In this dataset `is_arousing` is 1 for every image, so it cannot be used. Arousal and valence labels are correlated here (joy images are rated more aroused on average), so their accuracies are not independent.
+- The metadata CSV (`data/training/records.csv`) has ready-made `valence` and `arousal` columns, appended as the last two columns. The targets read these columns. To compare with another dataset, give its CSV the same two columns on the same definition. A dataset without them can use `"columns": {"positive_mean": 1, "negative_mean": -1}` instead.
+- **Valence** (column `valence`) = `positive_mean − negative_mean`, so a positive value means the image was rated more positive than negative. The label is positive when valence > 0. The current dataset has 566 images: 383 positive and 183 negative. It also contains neutral images, whose valence lies near 0, so their labels are noisier.
+- **Arousal** (column `arousal`) = `aroused_mean`, labelled high when above the dataset median (2.34; 283 low / 283 high). Use the continuous rating rather than the binary `is_arousing` flag.
 - The continuous valence/arousal values are saved with the trial log and epochs, so you can relabel or run regression offline.
 - **`device_channels`**: `None` assumes the eight electrodes are on Unicorn channels 1–8 in the listed order. The Unicorn's stock order is Fz, C3, Cz, C4, Pz, PO7, Oz, PO8. If the wiring differs, list the channel index (0–7) for each electrode.
 - **Bandpass** is 1–48 Hz so that the gamma band (30–45 Hz) is kept. The 50 Hz notch stays on. If a configured band falls outside the bandpass, the app shows a warning.
@@ -153,7 +154,7 @@ The Qt paint callback still precedes the screen's actual light output by an unme
 
 What changed compared with the original happy/sad trainer:
 
-- **Dataset**: the app reads `data/training/joy` and `data/training/sadness` (143 + 74 images) instead of `training_dataset/happy_images|sad_images`. The two old emoji images moved to `archive/`. Labels come from the metadata CSV next to each folder, and switching datasets only needs the `datasets` list in `CONFIG`.
+- **Dataset**: the app reads one image folder, `data/training/images` (566 images), with `data/training/records.csv` as its metadata. Earlier versions used `data/training/joy` and `data/training/sadness` with 143 + 74 images. The two old emoji images moved to `archive/`. Switching datasets only needs the `datasets` list in `CONFIG`; a dataset entry may name its CSV explicitly.
 - **Single config** (`hotbrain/config.py`): montage, sampling rate, filters, bands, feature families, targets and classifiers live in one validated dictionary, matching `basic_info.md`.
 - **EEG processing**:
   - electrodes are Fz, C3, Cz, C4, P3, Pz, P4, Oz (previously Fz, C3, Cz, C4, Pz, PO7, Oz, PO8);
@@ -174,7 +175,7 @@ What changed compared with the original happy/sad trainer:
   - per-session logs.
 - **Docs**: Polish summaries of the papers in `docs/papers/`, and a document on possible improvements with a critical review in `docs/optymalizacje_i_ocena_krytyczna.md`.
 - **Classifiers**: a registry (`hotbrain/classifiers.py`) with logistic regression, RBF SVM, linear SVM and shallow random forest. The GUI checkboxes select any combination. Every target × selected classifier is refitted on each completed EEG trial and evaluated test-before-train; the GUI shows each one's rolling accuracy and linear weights where available. SVMs use cross-validated sigmoid calibration to provide probabilities.
-- **Trial plan**: trials are balanced across dataset folders, and the trial count must be a multiple of the number of folders.
+- **Trial plan**: trials are balanced across the `balance_by` groups (default: valence classes) or across dataset folders, and the trial count must be a multiple of the number of groups.
 - **Saving**: save checkboxes select fitted target/model pairs. One `.joblib` per selected model, a manifest with the full config, resolved thresholds and per-trial predictions, and epochs with labels and continuous target values.
 - **GUI**: the electrode map follows the configured montage and has 10-20 positions for common electrodes.
 - **Tests**: updated for the new montage and features. New tests cover the real dataset, config validation, target formulas, fractal dimension and multi-model training.

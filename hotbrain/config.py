@@ -13,10 +13,15 @@ from typing import Any
 CONFIG: dict[str, Any] = {
     # Root folder for stimuli, relative to the project directory.
     "data_dir": "data",
-    # Subfolders of data_dir with images. Each folder needs a metadata CSV next
-    # to it with the same name, e.g. data/training/joy -> data/training/joy.csv.
-    # Trials are balanced across these folders.
-    "datasets": ["training/joy", "training/sadness"],
+    # Image folders under data_dir. Each entry is either
+    #   "sub/folder"  -> metadata CSV next to it with the same name (sub/folder.csv), or
+    #   {"images": "sub/folder", "metadata": "sub/records.csv"} for any CSV name.
+    # The CSV needs one row per image; extra rows without an image file are reported.
+    "datasets": [{"images": "training/images", "metadata": "training/records.csv"}],
+    # Training trials are balanced across these groups and the 80/20 split is
+    # stratified by them: a target name (e.g. "valence" = its two classes) or
+    # None to balance across the dataset folders.
+    "balance_by": "valence",
     # Column in the metadata CSV that holds the image file name.
     "image_column": "image_name",
     # Training/validation split of the datasets above, stratified per folder
@@ -207,17 +212,46 @@ class AppConfig:
     test_rest_s: float = 5.0
     feedback_update_s: float = 0.25
     feedback_smoothing: float = 0.3
+    # Explicit metadata CSV per image folder (folders not listed use <folder>.csv).
+    dataset_metadata: tuple[tuple[str, str], ...] = ()
+    balance_by: str | None = None
+
+    @property
+    def n_trial_groups(self) -> int:
+        """Groups a finite training run is balanced across (the trial count must be a multiple)."""
+        return 2 if self.balance_by else len(self.datasets)
+
+    def metadata_path(self, folder: str) -> Path:
+        override = dict(self.dataset_metadata).get(folder)
+        return self.data_dir / override if override else (self.data_dir / folder).with_suffix(".csv")
 
     @classmethod
     def from_dict(cls, d: dict, root: Path) -> "AppConfig":
         from .classifiers import CLASSIFIERS
 
-        datasets = tuple(str(p) for p in d["datasets"])
+        def parse_sources(entries) -> tuple[tuple[str, ...], tuple[tuple[str, str], ...]]:
+            folders, metadata = [], []
+            for entry in entries:
+                if isinstance(entry, dict):
+                    if "images" not in entry:
+                        raise ValueError("dataset entries given as dicts need an 'images' folder")
+                    folders.append(str(entry["images"]))
+                    if entry.get("metadata"):
+                        metadata.append((str(entry["images"]), str(entry["metadata"])))
+                else:
+                    folders.append(str(entry))
+            return tuple(folders), tuple(metadata)
+
+        datasets, dataset_metadata = parse_sources(d["datasets"])
         if not datasets:
             raise ValueError("datasets must list at least one subfolder of data_dir")
+        test_datasets, test_metadata = parse_sources(d.get("test_datasets", ("test",)))
         targets = tuple(TargetSpec.from_dict(name, t) for name, t in d["targets"].items())
         if not targets:
             raise ValueError("targets must define at least one classification target")
+        balance_by = d.get("balance_by")
+        if balance_by is not None and balance_by not in {t.name for t in targets}:
+            raise ValueError(f"balance_by must be a target name or None, got {balance_by!r}")
         classifiers = tuple(d.get("classifiers", ("logreg",)))
         unknown = [c for c in classifiers if c not in CLASSIFIERS]
         if unknown:
@@ -236,4 +270,5 @@ class AppConfig:
         return cls(data_dir if data_dir.is_absolute() else root / data_dir, datasets,
                    str(d.get("image_column", "image_name")), EEGSettings.from_dict(d["eeg"]),
                    targets, classifiers, d, fraction, int(split.get("seed", 42)),
-                   tuple(str(p) for p in d.get("test_datasets", ("test",))), trial_s, rest_s, update_s, smoothing)
+                   test_datasets, trial_s, rest_s, update_s, smoothing,
+                   dataset_metadata + test_metadata, balance_by)

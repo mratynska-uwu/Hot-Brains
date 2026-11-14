@@ -117,7 +117,7 @@ class TrainingPanel(QWidget):
 
     def __init__(self, config: AppConfig, min_image_s: float):
         super().__init__()
-        self.n_groups = len(config.datasets)
+        self.n_groups = config.n_trial_groups
         self.class1_names = {target.name: target.classes[1] for target in config.targets}
         layout = QVBoxLayout(self)
         self.heading = QLabel("Scene emotion training")
@@ -229,8 +229,9 @@ class TrainingPanel(QWidget):
         self.config_note.setWordWrap(True)
         self.config_note.setObjectName("warning")
         settings_layout.addWidget(self.config_note)
-        self.detail = QLabel(f"Finite runs are exactly balanced across the {self.n_groups} dataset folders and shuffled; "
-                             "continuous runs draw a folder uniformly at random. Each target/classifier pair predicts a trial "
+        balance = f"the {config.balance_by} classes" if config.balance_by else f"the {self.n_groups} dataset folders"
+        self.detail = QLabel(f"Finite runs are exactly balanced across {balance} and shuffled; "
+                             "continuous runs draw a group uniformly at random. Each target/classifier pair predicts a trial "
                              "before that trial is added to its fit. OSCAR adapts online; g.Pype does not expose a saved calibration state.")
         self.detail.setWordWrap(True)
         settings_layout.addWidget(self.detail)

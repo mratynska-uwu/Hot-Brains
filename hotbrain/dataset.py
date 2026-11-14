@@ -31,6 +31,8 @@ class Dataset:
     thresholds: dict[str, float | None]
     # Half-range of each target around its threshold, used to map values to [-1, 1].
     scales: dict[str, float] = field(default_factory=dict)
+    # CSV rows whose image file is missing from the folder (they are skipped).
+    rows_without_image: list[str] = field(default_factory=list)
 
     @property
     def images(self) -> list[StimulusImage]:
@@ -53,6 +55,9 @@ class Dataset:
             ones = sum(i.labels[t.name] for i in images)
             rule = t.formula if self.thresholds[t.name] is None else f"{t.formula} > {self.thresholds[t.name]:.3g}"
             parts.append(f"{t.name} ({rule}): {t.classes[0]} {len(images) - ones} / {t.classes[1]} {ones}")
+        if self.rows_without_image:
+            parts.append(f"{len(self.rows_without_image)} CSV row(s) without an image file skipped "
+                         f"(e.g. {', '.join(self.rows_without_image[:3])})")
         return " · ".join(parts)
 
     def manifest(self) -> dict:
@@ -80,13 +85,14 @@ def load_dataset(config: AppConfig, folders: tuple[str, ...] | list[str] | None 
     """
     rows: dict[Path, tuple[str, dict[str, str]]] = {}
     groups: dict[str, list[Path]] = {}
+    rows_without_image: list[str] = []
     for folder_name in (config.datasets if folders is None else folders):
         folder = config.data_dir / folder_name
-        csv_path = folder.with_suffix(".csv")
+        csv_path = config.metadata_path(folder_name)
         if not folder.is_dir():
             raise ValueError(f"Dataset folder not found: {folder}")
         if not csv_path.is_file():
-            raise ValueError(f"Missing metadata CSV next to the folder: {csv_path}")
+            raise ValueError(f"Missing metadata CSV for {folder_name}: {csv_path}")
         metadata = _read_metadata(csv_path, config.image_column)
         paths = sorted(p for p in folder.iterdir() if p.is_file() and p.suffix.lower() in IMAGE_SUFFIXES)
         if not paths:
@@ -94,6 +100,8 @@ def load_dataset(config: AppConfig, folders: tuple[str, ...] | list[str] | None 
         missing = [p.name for p in paths if p.name not in metadata]
         if missing:
             raise ValueError(f"{len(missing)} image(s) in {folder_name} have no row in {csv_path.name}, e.g. {missing[:3]}")
+        on_disk = {p.name for p in paths}
+        rows_without_image += sorted(name for name in metadata if name not in on_disk)
         groups[folder_name] = paths
         for p in paths:
             rows[p] = (folder_name, metadata[p.name])
@@ -129,5 +137,13 @@ def load_dataset(config: AppConfig, folders: tuple[str, ...] | list[str] | None 
     else:
         scales = {t.name: max((abs(scores[p][t.name] - thresholds[t.name]) for p in rows), default=1.0) or 1.0
                   for t in config.targets if thresholds[t.name] is not None}
+    if config.balance_by:
+        # Regroup by the classes of one target, e.g. "valence=negative" / "valence=positive".
+        target = next(t for t in config.targets if t.name == config.balance_by)
+        regrouped: dict[str, list[Path]] = {}
+        for paths in groups.values():
+            for p in paths:
+                regrouped.setdefault(f"{target.name}={target.classes[labels[p][target.name]]}", []).append(p)
+        groups = {g: sorted(v) for g, v in sorted(regrouped.items())}
     return Dataset({g: [StimulusImage(p, g, labels[p], scores[p]) for p in paths] for g, paths in groups.items()},
-                   config.targets, thresholds, scales)
+                   config.targets, thresholds, scales, rows_without_image)
