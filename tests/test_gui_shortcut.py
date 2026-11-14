@@ -2,6 +2,7 @@
 
 import copy
 import os
+import time
 from pathlib import Path
 
 import numpy as np
@@ -13,6 +14,7 @@ from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication
 
 import hotbrain.gui as gui
+from hotbrain.acquisition import SampleRing
 from hotbrain.config import CONFIG
 from hotbrain.training import MultiTrainer
 
@@ -23,11 +25,30 @@ class NoDevice(QObject):
 
     def __init__(self, eeg, serial):
         super().__init__()
+        self.eeg = eeg
         self.connected = False
-        self.oscar = False
+        self.oscar = True
+        self.serial = serial
+        self.ring = SampleRing(fs=eeg.fs, channels=eeg.device_channels)
+
+    def provide_test_frames(self):
+        # Isolated unit-test fixture; the application never synthesizes EEG.
+        samples = 500
+        t = np.arange(samples) / self.eeg.fs
+        frame = np.column_stack([20 * np.sin(2 * np.pi * (8 + i) * t) for i in range(8)])
+        self.ring.append(frame, 0)
+        was_connected = self.connected
+        self.connected = True
+        if not was_connected:
+            self.connected_changed.emit(True)
+
+    def stream_ready(self, max_age_s=1.0):
+        return (self.connected and self.ring.received_samples >= self.eeg.fs // 2
+                and time.perf_counter() - self.ring.last_arrival <= max_age_s)
 
     def configure(self, oscar, serial):
         self.oscar = oscar
+        self.serial = serial
 
     def set_retention(self, seconds):
         self.retention_s = seconds
@@ -68,6 +89,12 @@ def test_chosen_key_stops_from_presentation_window(tmp_path: Path, monkeypatch):
         assert window.geometry().right() < window.presentation_window.geometry().left()
         assert window.presentation_window.geometry().right() < window.features_window.geometry().left()
         assert window.dataset is not None, window.training.dataset_status.text()
+        assert not window.training.start.isEnabled()
+        window.start_run()
+        assert not window.active
+        assert window.shown == 0
+        assert window.presentation.stimulus.state == "idle"
+        assert not window.features.samples
         assert window.training.image_seconds.value() == 4.5
         assert window.training.fixation_min.value() == 2.0
         assert window.training.fixation_max.value() == 3.0
@@ -81,6 +108,10 @@ def test_chosen_key_stops_from_presentation_window(tmp_path: Path, monkeypatch):
         window.training.fixation_max.setValue(4.0)
         assert "+1700 ms" in window.presentation.note.text()
         for key_name, key_code in (("Escape", Qt.Key.Key_Escape), ("F8", Qt.Key.Key_F8)):
+            window.device.provide_test_frames()
+            window.poll()
+            assert window.training.start.isEnabled()
+            assert not window.features.samples
             if key_name == "Escape":
                 for key, box in window.training.train_boxes.items():
                     box.setChecked(key == "svm")
@@ -91,6 +122,8 @@ def test_chosen_key_stops_from_presentation_window(tmp_path: Path, monkeypatch):
             window.start_run()
             app.processEvents()
             assert window.active
+            window.poll()
+            assert window.features.samples
             assert window.training.settings_scroll.isHidden()
             assert window.training.accuracy.columnCount() == 6
             assert window.training.accuracy.rowCount() == (2 if key_name == "Escape" else 6)
@@ -107,8 +140,34 @@ def test_chosen_key_stops_from_presentation_window(tmp_path: Path, monkeypatch):
             assert not window.active
             assert not window.stop_shortcut.isEnabled()
             assert not window.training.save.isEnabled()
+            frozen_count = len(window.features.samples)
+            frozen_value = window.features.current.text()
+            frozen_lights = list(window.features.quality_map.ratings)
+            window.device.provide_test_frames()
+            window.poll()
+            assert len(window.features.samples) == frozen_count
+            assert window.features.current.text() == frozen_value
+            assert window.features.quality_map.ratings == frozen_lights
+            window.device.connected = False
+            window.device.connected_changed.emit(False)
+            assert not window.features.samples
+            assert window.features.current.text() == "Current value: —"
             window.discard_run()
+            assert not window.training.start.isEnabled()
             assert not window.training.settings_scroll.isHidden()
+        window.device.provide_test_frames()
+        window.poll()
+        window.start_run()
+        assert window.active
+        with window.device.ring._lock:
+            window.device.ring._last_arrival -= 2
+        window.poll()
+        assert not window.active
+        assert "EEG stream stopped" in window.training.status.text()
+        window.device.connected = False
+        window.device.connected_changed.emit(False)
+        assert not window.features.samples
+        window.discard_run()
         trainer = MultiTrainer(["valence", "arousal"], ["logreg", "svm", "forest"],
                                len(window.extractor.names))
         for number in range(16):

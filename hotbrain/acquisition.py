@@ -26,12 +26,20 @@ class SampleRing:
         self._lock = threading.Lock()
         self._blocks: deque[tuple[np.ndarray, np.ndarray]] = deque()
         self._latest = 0.0
+        self._last_arrival = 0.0
+        self._received_samples = 0
         self._end_time: float | None = None
         self.retention_s = retention_s
 
     def append(self, frame: np.ndarray, delay_s: float):
-        values = np.asarray(frame, dtype=np.float64)[:, self.channels].copy()
-        observed_end = time.perf_counter() - delay_s
+        raw = np.asarray(frame, dtype=np.float64)
+        if raw.ndim != 2 or not len(raw) or raw.shape[1] <= max(self.channels):
+            raise ValueError("Invalid EEG frame shape")
+        values = raw[:, self.channels].copy()
+        if not np.isfinite(values).all():
+            raise ValueError("Non-finite EEG samples")
+        arrival = time.perf_counter()
+        observed_end = arrival - delay_s
         with self._lock:
             # Bluetooth frames arrive in bursts. Re-timestamping every frame
             # from callback time creates artificial 20-70 ms gaps. Anchor the
@@ -40,6 +48,8 @@ class SampleRing:
             times = end - np.arange(len(values) - 1, -1, -1) / self.fs
             self._blocks.append((times, values))
             self._latest = end
+            self._last_arrival = arrival
+            self._received_samples += len(values)
             self._end_time = end
             while self._blocks and self._blocks[0][0][-1] < end - self.retention_s:
                 self._blocks.popleft()
@@ -48,6 +58,17 @@ class SampleRing:
     def latest(self) -> float:
         with self._lock:
             return self._latest
+
+    @property
+    def last_arrival(self) -> float:
+        """Host time of the latest real SDK frame, independent of estimated EEG timestamps."""
+        with self._lock:
+            return self._last_arrival
+
+    @property
+    def received_samples(self) -> int:
+        with self._lock:
+            return self._received_samples
 
     def recent(self, seconds: float = 4) -> tuple[np.ndarray, np.ndarray]:
         with self._lock:
@@ -110,7 +131,6 @@ class DeviceManager(QObject):
         if self.oscar != oscar or self.serial != serial:
             self.oscar = oscar
             self.serial = serial
-            self._generation += 1
             self._attempting = False
             self.disconnect()
             self._last_attempt = 0
@@ -123,11 +143,17 @@ class DeviceManager(QObject):
         self.retention_s = max(20.0, seconds)
         self.ring.retention_s = self.retention_s
 
+    def stream_ready(self, max_age_s: float = 1.0) -> bool:
+        """Require a current SDK stream and enough samples for the pre-onset baseline."""
+        ring = self.ring
+        return (self.connected and ring.received_samples >= self.eeg.fs // 2
+                and 0 <= time.perf_counter() - ring.last_arrival <= max_age_s)
+
     def _tick(self):
         now = time.perf_counter()
         if self.connected:
             # A stream that stopped producing data has disconnected.
-            if now - max(self.ring.latest, self._connected_at) > 2.5:
+            if now - max(self.ring.last_arrival, self._connected_at) > 2.5:
                 self.status_changed.emit("EEG stream stalled; reconnecting…")
                 self.disconnect()
             else:
@@ -156,9 +182,14 @@ class DeviceManager(QObject):
 
                 def step(self, data):
                     frame = data.get("in")
+                    ring = manager.ring
                     if generation == manager._generation and frame is not None and len(frame):
                         oscar_samples = source.oscar_delay_samples or 0
-                        manager.ring.append(frame, .040 + oscar_samples / manager.eeg.fs)
+                        try:
+                            ring.append(frame, .040 + oscar_samples / manager.eeg.fs)
+                        except ValueError:
+                            # Invalid SDK frames do not count as a live stream.
+                            pass
                     return {}
 
             pipeline = gp.Pipeline()
@@ -189,7 +220,7 @@ class DeviceManager(QObject):
         self._connected_at = time.perf_counter()
         self.connected_changed.emit(True)
         self.status_changed.emit("Unicorn " + (self.serial or "(first available)") +
-                                 " connected · OSCAR " + ("on" if self.oscar else "off"))
+                                 " opened; waiting for EEG samples · OSCAR " + ("on" if self.oscar else "off"))
 
     def _failed(self, reason: str, generation: int):
         if generation != self._generation:
@@ -201,6 +232,7 @@ class DeviceManager(QObject):
             self._last_error = message
 
     def disconnect(self):
+        self._generation += 1
         was_connected = self.connected
         self.connected = False
         if self.pipeline is not None:
@@ -220,5 +252,4 @@ class DeviceManager(QObject):
 
     def close(self):
         self._retry.stop()
-        self._generation += 1
         self.disconnect()

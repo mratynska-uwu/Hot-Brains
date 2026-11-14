@@ -468,7 +468,7 @@ class FeaturePanel(QWidget):
         heading = QLabel("EEG features over time")
         heading.setObjectName("heading")
         layout.addWidget(heading)
-        self.note = QLabel("Waiting for a Unicorn signal. Values are extracted from rolling EEG windows; no synthetic EEG is shown.")
+        self.note = QLabel("Paused. EEG features appear only during training with a live Unicorn stream.")
         self.note.setWordWrap(True)
         layout.addWidget(self.note)
         quality_title = QLabel("Electrode signal checks")
@@ -502,9 +502,16 @@ class FeaturePanel(QWidget):
         self.samples = [item for item in self.samples if item[0] >= stamp - 60]
         self.redraw()
 
+    def clear(self):
+        self.samples.clear()
+        self.set_quality(None)
+        self.redraw()
+
     def redraw(self):
         if not self.samples:
-            self.curve.setData([], []); return
+            self.curve.setData([], [])
+            self.current.setText("Current value: —")
+            return
         index = self.selector.currentIndex()
         start = self.samples[0][0]
         self.curve.setData([t - start for t, _ in self.samples], [float(v[index]) for _, v in self.samples])
@@ -539,13 +546,12 @@ class MainWindow(QMainWindow):
         self.config = AppConfig.from_dict(CONFIG if config is None else config, root)
         self.extractor = FeatureExtractor(self.config.eeg)
         self.quality = SignalQuality(self.config.eeg)
-        self.idle_spec = self.extractor.epoch_spec(max(1000, self.extractor.min_image_duration_ms))
         self.setWindowTitle("Hot Brain · scene training")
         self.resize(720, 900)
         self.training = TrainingPanel(self.config, self.extractor.min_image_duration_ms / 1000)
         self.device = DeviceManager(self.config.eeg, self.training.serial.text().strip() or None)
         self.presentation = PresentationPanel()
-        self.epoch_spec = self.idle_spec
+        self.epoch_spec = self.extractor.epoch_spec(round(self.training.image_seconds.value() * 1000))
         for control in (self.training.image_seconds, self.training.fixation_min, self.training.fixation_max):
             control.valueChanged.connect(self.update_timing_note)
         self.update_timing_note()
@@ -567,6 +573,8 @@ class MainWindow(QMainWindow):
         self.presentation.stimulus.onset.connect(self.on_image_onset)
         self.device.status_changed.connect(self.training.device_status.setText)
         self.device.connected_changed.connect(self.on_connection)
+        self.training.serial.editingFinished.connect(self.configure_device_from_controls)
+        self.training.oscar.toggled.connect(self.configure_device_from_controls)
         warnings = self.config.eeg.warnings()
         self.training.config_note.setText("\n".join(f"Config warning: {w}" for w in warnings))
         self.training.config_note.setVisible(bool(warnings))
@@ -577,6 +585,8 @@ class MainWindow(QMainWindow):
         self.next_trial: StimulusImage | None = None
         self.active = False
         self.finishing = False
+        self.ready_for_new_run = True
+        self.stop_reason: str | None = None
         self.shown = 0
         self.usable = 0
         self.skipped = 0
@@ -594,6 +604,8 @@ class MainWindow(QMainWindow):
         self.clock.setInterval(100)
         self.clock.timeout.connect(self.poll)
         self.clock.start()
+        self.training.start.setEnabled(False)
+        self.training.status.setText("Waiting for live EEG samples before training can start.")
         self.setStyleSheet("QMainWindow,QWidget{background:#182335;color:#e8effc;font-size:13px} QLabel#heading{font-size:24px;font-weight:700;margin:4px 0 10px} QLabel#metric{font-size:18px;font-weight:600;color:#6dd7bf} QLabel#warning{color:#ffb86b} QLabel#status{font-size:16px;font-weight:600} QPushButton{background:#29466c;border-radius:7px;padding:8px 12px} QPushButton:hover{background:#376293} QPushButton:disabled{background:#354155;color:#8d9aaf} QSpinBox,QDoubleSpinBox,QComboBox{background:#25364e;padding:5px;border:1px solid #627795} QTabBar::tab{padding:9px 17px}")
 
     @property
@@ -638,14 +650,40 @@ class MainWindow(QMainWindow):
         self.features_window.show()
 
     def on_connection(self, connected: bool):
-        eeg = self.config.eeg
-        self.features.note.setText(
-            f"Live Unicorn EEG · {eeg.fs} Hz · {', '.join(eeg.electrodes)} · OSCAR " + ("on" if self.device.oscar else "off")
-            if connected else "Waiting for Unicorn; continuing image loop without EEG.")
         if not connected:
-            self.features.set_quality(None)
+            self.features.clear()
+            self.features.note.setText("No live EEG stream. Feature values have been cleared.")
+            if self.active:
+                self.stop_run("EEG stream disconnected; training stopped.")
+        elif not self.active:
+            self.features.note.setText("Unicorn opened. Waiting for current EEG samples; features are paused.")
+        self.update_start_availability()
+
+    def configure_device_from_controls(self):
+        if self.active or self.finishing:
+            return
+        self.device.configure(self.training.oscar.isChecked(), self.training.serial.text().strip() or None)
+        self.update_start_availability()
+
+    def update_start_availability(self):
+        self.training.start.setEnabled(
+            self.ready_for_new_run and not self.active and not self.finishing and self.device.stream_ready())
+
+    def ensure_eeg_stream(self) -> bool:
+        if self.device.stream_ready():
+            return True
+        if self.active:
+            self.stop_run("EEG stream stopped; training stopped.")
+        return False
 
     def start_run(self):
+        if self.active or self.finishing or not self.ready_for_new_run:
+            return
+        self.configure_device_from_controls()
+        if not self.device.stream_ready():
+            self.training.status.setText("Waiting for current EEG samples. Training cannot start without a live stream.")
+            self.update_start_availability()
+            return
         fixation_min = self.training.fixation_min.value()
         fixation_max = self.training.fixation_max.value()
         if fixation_min > fixation_max:
@@ -678,6 +716,8 @@ class MainWindow(QMainWindow):
         self.training.configure_models(list(self.trainer.models), self.extractor.names)
         self.pending.clear()
         self.shown = self.usable = self.skipped = 0
+        self.ready_for_new_run = False
+        self.stop_reason = None
         self.training.start.setEnabled(False)
         self.training.stop.setEnabled(True)
         self.training.settings_scroll.setVisible(False)
@@ -688,6 +728,12 @@ class MainWindow(QMainWindow):
             widget.setEnabled(False)
         self.active = True
         self.finishing = False
+        self.features.clear()
+        self.features.note.setText(
+            f"Live Unicorn EEG · {self.config.eeg.fs} Hz · {', '.join(self.config.eeg.electrodes)} · OSCAR "
+            + ("on" if self.device.oscar else "off"))
+        self.last_feature_time = 0.0
+        self.last_quality_time = 0.0
         self.trial_log = []
         self.epochs = []
         self.epoch_trial_numbers = []
@@ -716,20 +762,17 @@ class MainWindow(QMainWindow):
                              "oscar_settling_applied_seconds": 0,
                              "dataset": self.dataset.manifest(),
                              "timing_note": f"Image onset uses Qt paint completion; EEG times anchor to first host frame arrival minus device/OSCAR delay then advance at {eeg.fs} Hz. Validate with hardware trigger."}
-        self.device.configure(self.training.oscar.isChecked(), self.training.serial.text().strip() or None)
-        if self.training.oscar.isChecked() and self.training.warmup.isChecked() and self.device.connected:
+        if self.training.oscar.isChecked() and self.training.warmup.isChecked():
             seconds = self.training.warmup_seconds.value()
             self.run_metadata["oscar_settling_applied_seconds"] = seconds
             self.training.status.setText(f"OSCAR settling: {seconds} s before first trial")
             self.presentation.stimulus.fixation()
             QTimer.singleShot(seconds * 1000, self.begin_fixation)
         else:
-            if self.training.oscar.isChecked() and self.training.warmup.isChecked() and not self.device.connected:
-                self.training.status.setText("No EEG yet; starting image loop. OSCAR will adapt when a device connects.")
             self.begin_fixation()
 
     def begin_fixation(self):
-        if not self.active:
+        if not self.active or not self.ensure_eeg_stream():
             return
         self.next_trial = self.plan.next() if self.plan else None
         if self.next_trial is None:
@@ -740,13 +783,13 @@ class MainWindow(QMainWindow):
                                          round(self.training.fixation_max.value() * 1000)), self.show_trial)
 
     def show_trial(self):
-        if not self.active or self.next_trial is None:
+        if not self.active or not self.ensure_eeg_stream() or self.next_trial is None:
             return
         self.presentation.stimulus.image(self.next_trial.path)
         # The paint callback is the closest software-side onset observation.
 
     def on_image_onset(self, stamp: float):
-        if not self.active or self.next_trial is None:
+        if not self.active or not self.ensure_eeg_stream() or self.next_trial is None:
             return
         item = self.next_trial
         self.shown += 1
@@ -762,22 +805,40 @@ class MainWindow(QMainWindow):
         QTimer.singleShot(self.epoch_spec.image_duration_ms, self.end_image)
 
     def end_image(self):
-        if not self.active:
+        if not self.active or not self.ensure_eeg_stream():
             return
         self.presentation.stimulus.fixation()
         self.begin_fixation()
 
     def poll(self):
         now = time.perf_counter()
-        if now - self.last_quality_time >= .5:
+        stream_ready = self.device.stream_ready()
+        if self.active and not stream_ready:
+            self.stop_run("EEG stream stopped; training stopped.")
+        self.update_start_availability()
+        if stream_ready:
+            device_text = (f"Unicorn {self.device.serial or '(first available)'} streaming EEG · OSCAR "
+                           + ("on" if self.device.oscar else "off"))
+            if self.training.device_status.text() != device_text:
+                self.training.device_status.setText(device_text)
+            if self.ready_for_new_run and self.training.status.text().startswith("Waiting for"):
+                self.training.status.setText("EEG stream ready. Start training.")
+        elif self.device.connected:
+            self.training.device_status.setText("Unicorn opened, but no current EEG samples. Training disabled.")
+        if not stream_ready:
+            if self.features.samples or any(rating.good is not None for rating in self.features.quality_map.ratings):
+                self.features.clear()
+            self.features.note.setText("No live EEG stream. Feature values have been cleared.")
+        elif not self.active:
+            self.features.note.setText(
+                "Frozen at training stop. No new features are plotted."
+                if self.features.samples else "EEG stream ready. Features are paused until training starts.")
+        elif now - self.last_quality_time >= .5:
             self.last_quality_time = now
-            if self.device.connected and now - self.device.ring.latest < 1.0:
-                _, quality_samples = self.device.ring.recent(3)
-                self.features.set_quality(self.quality.assess(quality_samples))
-            else:
-                self.features.set_quality(None)
-        if self.device.connected and now - self.last_feature_time >= .25:
-            spec = self.epoch_spec if self.active or self.finishing else self.idle_spec
+            _, quality_samples = self.device.ring.recent(3)
+            self.features.set_quality(self.quality.assess(quality_samples))
+        if self.active and stream_ready and now - self.last_feature_time >= .25:
+            spec = self.epoch_spec
             times, samples = self.device.ring.recent(max(2, spec.n_samples / spec.fs + 1))
             if len(samples) >= spec.n_samples and times[-1] > self.last_feature_time:
                 try:
@@ -831,21 +892,24 @@ class MainWindow(QMainWindow):
     def _update_counts(self):
         self.training.count_status.setText(f"Trials: {self.shown} · usable EEG: {self.usable} · skipped: {self.skipped}")
 
-    def stop_run(self):
+    def stop_run(self, reason: str | None = None):
         if not self.active:
             return
         self.active = False
         self.finishing = True
+        self.stop_reason = reason
         self.presentation.stimulus.idle()
+        self.features.note.setText("Frozen at training stop. No new features are plotted.")
         self.training.stop.setEnabled(False)
         self.stop_shortcut.setEnabled(False)
-        self.training.status.setText("Finishing pending EEG epochs…")
+        self.training.status.setText((reason + " " if reason else "") + "Finishing pending EEG epochs…")
         if not self.pending:
             self.finish_run()
 
     def finish_run(self):
         self.finishing = False
-        self.training.status.setText(f"Stopped after {self.shown} presentations; {self.usable} usable EEG trials.")
+        self.training.status.setText((self.stop_reason + " " if self.stop_reason else "")
+                                     + f"Stopped after {self.shown} presentations; {self.usable} usable EEG trials.")
         self.training.prepare_save_selection(self.trainer)
         self.training.discard.setEnabled(True)
         self.run_metadata.update({"stopped_at": datetime.now().astimezone().isoformat(),
@@ -879,7 +943,8 @@ class MainWindow(QMainWindow):
                             channels=np.asarray(self.config.eeg.electrodes, dtype=str), **labels)
         self.training.status.setText(f"Saved {len(written) + 1} files to saved_models/{stem.name}.*")
         self.training.reset_save_selection()
-        self.training.start.setEnabled(True)
+        self.ready_for_new_run = True
+        self.update_start_availability()
         self.training.settings_scroll.setVisible(True)
         self.training.discard.setEnabled(False)
         self._enable_settings()
@@ -892,7 +957,8 @@ class MainWindow(QMainWindow):
         self.epoch_values = []
         self.epoch_groups = []
         self.training.status.setText("Run discarded. Ready to start again.")
-        self.training.start.setEnabled(True)
+        self.ready_for_new_run = True
+        self.update_start_availability()
         self.training.settings_scroll.setVisible(True)
         self.training.reset_save_selection()
         self.training.discard.setEnabled(False)

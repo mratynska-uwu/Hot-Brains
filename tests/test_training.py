@@ -7,7 +7,9 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from hotbrain.acquisition import SampleRing
+from PySide6.QtCore import QCoreApplication
+
+from hotbrain.acquisition import DeviceManager, SampleRing
 from hotbrain.config import CONFIG, AppConfig, EEGSettings
 from hotbrain.dataset import StimulusImage, load_dataset
 from hotbrain.features import EpochSpec, FeatureExtractor, higuchi_fd
@@ -16,6 +18,31 @@ from hotbrain.training import MultiTrainer, TrialPlan, predict_saved
 ROOT = Path(__file__).resolve().parents[1]
 EEG = EEGSettings.from_dict(CONFIG["eeg"])
 N_CH = len(EEG.electrodes)
+
+
+def test_stream_ready_requires_recent_sdk_frames(monkeypatch):
+    QCoreApplication.instance() or QCoreApplication([])
+    monkeypatch.setattr(DeviceManager, "_tick", lambda self: None)
+    device = DeviceManager(EEG)
+    try:
+        assert not device.stream_ready()
+        device.connected = True  # SDK opened, but no frames yet.
+        assert not device.stream_ready()
+        with pytest.raises(ValueError, match="Non-finite"):
+            device.ring.append(np.full((EEG.fs, N_CH), np.nan), 0)
+        assert device.ring.received_samples == 0
+        device.ring.append(np.ones((EEG.fs // 2 - 1, N_CH)), 0)
+        assert not device.stream_ready()
+        device.ring.append(np.ones((1, N_CH)), 0)
+        assert device.stream_ready()
+        with device.ring._lock:
+            device.ring._last_arrival -= 2
+        assert not device.stream_ready()
+        device.disconnect()
+        assert not device.stream_ready()
+        assert device.ring.received_samples == 0
+    finally:
+        device.close()
 
 
 def test_config_matches_basic_info():
