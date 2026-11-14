@@ -6,6 +6,7 @@ from pathlib import Path
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
+import numpy as np
 from PySide6.QtCore import QObject, Qt, Signal
 from PySide6.QtGui import QImage
 from PySide6.QtTest import QTest
@@ -56,6 +57,20 @@ def test_chosen_key_stops_from_detached_presentation(tmp_path: Path, monkeypatch
         assert len(window.features.quality_map.POSITIONS) == 8
         assert all(rating.good is None for rating in window.features.quality_map.ratings)
         assert not window.features.quality_map.grab().isNull()
+        panel = window.features
+        panel.mode.setCurrentText(panel.MODE_BAND)
+        panel.band.setCurrentText("beta")
+        assert [label for _, label in panel.shown] == ["Fz", "C3", "Cz", "C4", "P3", "Pz", "P4", "Oz"]
+        panel.mode.setCurrentText(panel.MODE_ELECTRODE)
+        panel.electrode.setCurrentText("Cz")
+        assert [label for _, label in panel.shown] == ["alpha", "beta", "gamma"]
+        panel.mode.setCurrentText(panel.MODE_FD)
+        assert len(panel.curves) == len(panel.plots) == 8   # one plot per electrode
+        panel.mode.setCurrentText(panel.MODE_ELECTRODE)
+        assert len(panel.plots) == 3                          # one plot per band
+        panel.mode.setCurrentText(panel.MODE_FD)
+        panel.add(1.0, np.arange(len(window.extractor.names), dtype=float))
+        assert panel.current.text().startswith("Current values: Fz")
         window.training.image_seconds.setValue(2.0)
         window.training.fixation_min.setValue(2.0)
         window.training.fixation_max.setValue(4.0)

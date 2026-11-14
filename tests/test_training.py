@@ -115,22 +115,27 @@ def test_features_follow_config():
     extractor = FeatureExtractor(EEG)
     spec = extractor.epoch_spec(1000)
     features = extractor.extract(np.random.default_rng(3).normal(0, 4, (spec.n_samples, N_CH)), spec)
-    # 4 regions x 3 bands of log power + 8 per-electrode fractal dimensions
-    assert features.shape == (len(extractor.names),) == (20,)
-    assert any("gamma" in name for name in extractor.names)
-    assert sum("fractal" in name for name in extractor.names) == 8
+    # 8 electrodes x 3 bands of log power + 8 per-electrode fractal dimensions
+    assert features.shape == (len(extractor.names),) == (32,)
+    assert len(extractor.indices("band_power", band="gamma")) == 8
+    assert [extractor.info[i].band for i in extractor.indices("band_power", location="Oz")] == ["alpha", "beta", "gamma"]
+    assert [extractor.info[i].location for i in extractor.indices("fractal_dimension")] == list(EEG.electrodes)
     with pytest.raises(ValueError):
         extractor.epoch_spec(600)
 
 
 def test_optional_feature_families():
     eeg = copy.deepcopy(CONFIG["eeg"])
-    eeg["features"] = ["band_power", "fractal_dimension", "asymmetry", "erp"]
+    eeg["features"] = ["band_power", "fractal_dimension", "region_band_power", "asymmetry", "erp"]
     extractor = FeatureExtractor(EEGSettings.from_dict(eeg))
     spec = extractor.epoch_spec(1000)
     features = extractor.extract(np.random.default_rng(5).normal(0, 4, (spec.n_samples, N_CH)), spec)
-    # + 2 pairs x 3 bands of asymmetry + 3 ERP windows x 4 regions
-    assert features.shape == (20 + 6 + 12,)
+    # + 4 regions x 3 bands + 2 pairs x 3 bands of asymmetry + 3 ERP windows x 4 regions
+    assert features.shape == (32 + 12 + 6 + 12,)
+    # A single-electrode region averages the same spectrum as that electrode.
+    fz = extractor.indices("band_power", location="Fz")
+    frontal = extractor.indices("region_band_power", location="frontal")
+    assert np.allclose(features[fz], features[frontal])
     eeg["features"] = ["wavelets"]
     with pytest.raises(ValueError, match="wavelets"):
         EEGSettings.from_dict(eeg)

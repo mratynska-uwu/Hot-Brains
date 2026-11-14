@@ -65,6 +65,15 @@ def higuchi_fd(x: np.ndarray, kmax: int = 10) -> float:
     return float(slope)
 
 
+@dataclass(frozen=True)
+class FeatureInfo:
+    """What one feature measures, so the GUI can group features for display."""
+    family: str           # band_power, region_band_power, fractal_dimension, asymmetry, erp
+    location: str         # electrode, region or "right-left" pair
+    band: str | None      # band name for spectral features, else None
+    name: str
+
+
 class FeatureExtractor:
     def __init__(self, eeg: EEGSettings):
         self.eeg = eeg
@@ -72,24 +81,34 @@ class FeatureExtractor:
         index = {name: i for i, name in enumerate(eeg.electrodes)}
         self._regions = [(name, tuple(index[m] for m in members)) for name, members in eeg.regions]
         self._pairs = [(r, l, index[r], index[l]) for r, l in eeg.asymmetry_pairs]
-        names = []
+        info: list[FeatureInfo] = []
         for family in eeg.features:
             if family == "band_power":
+                for electrode in eeg.electrodes:
+                    for band, (lo, hi) in eeg.bands_hz:
+                        info.append(FeatureInfo(family, electrode, band, f"{electrode} {band} {lo:g}-{hi:g} Hz log power"))
+            elif family == "region_band_power":
                 for region, _ in self._regions:
                     for band, (lo, hi) in eeg.bands_hz:
-                        names.append(f"{region} {band} {lo:g}-{hi:g} Hz log power")
+                        info.append(FeatureInfo(family, region, band, f"{region} {band} {lo:g}-{hi:g} Hz log power"))
             elif family == "fractal_dimension":
                 for electrode in eeg.electrodes:
-                    names.append(f"{electrode} Higuchi fractal dimension")
+                    info.append(FeatureInfo(family, electrode, None, f"{electrode} Higuchi fractal dimension"))
             elif family == "asymmetry":
                 for right, left, _, _ in self._pairs:
                     for band, _ in eeg.bands_hz:
-                        names.append(f"{right}-{left} {band} log-power asymmetry")
+                        info.append(FeatureInfo(family, f"{right}-{left}", band, f"{right}-{left} {band} log-power asymmetry"))
             elif family == "erp":
                 for lo, hi in eeg.erp_windows_ms:
                     for region, _ in self._regions:
-                        names.append(f"{region} ERP {lo}-{'end' if hi is None else hi} ms")
-        self.names: tuple[str, ...] = tuple(names)
+                        info.append(FeatureInfo(family, region, None, f"{region} ERP {lo}-{'end' if hi is None else hi} ms"))
+        self.info: tuple[FeatureInfo, ...] = tuple(info)
+        self.names: tuple[str, ...] = tuple(f.name for f in info)
+
+    def indices(self, family: str, location: str | None = None, band: str | None = None) -> list[int]:
+        """Feature positions matching a family and optionally a location and/or band."""
+        return [i for i, f in enumerate(self.info) if f.family == family
+                and (location is None or f.location == location) and (band is None or f.band == band)]
 
     @property
     def channels(self) -> tuple[str, ...]:
@@ -135,6 +154,10 @@ class FeatureExtractor:
         out: list[float] = []
         for family in self.eeg.features:
             if family == "band_power":
+                for channel in range(len(self.channels)):
+                    for _, (lo, hi) in self.eeg.bands_hz:
+                        out.append(power(lo, hi, (channel,)))
+            elif family == "region_band_power":
                 for _, indices in self._regions:
                     for _, (lo, hi) in self.eeg.bands_hz:
                         out.append(power(lo, hi, indices))

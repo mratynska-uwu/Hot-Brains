@@ -5,3 +5,6 @@ saved_models/
 install.log
 launcher.log
 .DS_Store
+
+# Third-party papers (copyrighted PDFs); summaries live next to them as *_podsumowanie.md
+docs/papers/*.pdf

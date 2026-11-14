@@ -10,6 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Callable
 
+import numpy as np
 from sklearn.base import BaseEstimator
 from sklearn.linear_model import LogisticRegression
 from sklearn.pipeline import Pipeline, make_pipeline
@@ -35,6 +36,21 @@ def build(key: str) -> Pipeline:
     if key not in CLASSIFIERS:
         raise KeyError(f"Unknown classifier {key!r}; available: {sorted(CLASSIFIERS)}")
     return make_pipeline(StandardScaler(), CLASSIFIERS[key].factory())
+
+
+def probability_class1(model: Pipeline, features) -> float:
+    """P(label 1) for one feature vector.
+
+    Uses predict_proba when the model has it; otherwise squashes the decision
+    function with a logistic curve (an uncalibrated confidence, e.g. for SVMs).
+    """
+    x = np.asarray(features, dtype=np.float64).reshape(1, -1)
+    if hasattr(model, "predict_proba"):
+        return float(model.predict_proba(x)[0, 1])
+    if hasattr(model, "decision_function"):
+        margin = float(np.ravel(model.decision_function(x))[0])
+        return float(1 / (1 + np.exp(-np.clip(margin, -50, 50))))
+    return float(model.predict(x)[0])
 
 
 def coefficients(model: Pipeline | None):

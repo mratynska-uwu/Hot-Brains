@@ -29,6 +29,19 @@ class Dataset:
     groups: dict[str, list[StimulusImage]]
     targets: tuple[TargetSpec, ...]
     thresholds: dict[str, float | None]
+    # Half-range of each target around its threshold, used to map values to [-1, 1].
+    scales: dict[str, float] = field(default_factory=dict)
+
+    @property
+    def images(self) -> list[StimulusImage]:
+        return [i for items in self.groups.values() for i in items]
+
+    def normalized(self, target: str, value: float) -> float:
+        """Map a target value to [-1, 1]: 0 = class boundary, +-1 = most extreme training image."""
+        threshold = self.thresholds[target]
+        if threshold is None:
+            return float(max(-1.0, min(1.0, 2 * value - 1)))
+        return float(max(-1.0, min(1.0, (value - threshold) / self.scales.get(target, 1.0))))
 
     def class_name(self, target: str, label: int) -> str:
         return next(t for t in self.targets if t.name == target).classes[label]
@@ -45,7 +58,7 @@ class Dataset:
     def manifest(self) -> dict:
         return {"groups": {g: [i.path.name for i in v] for g, v in self.groups.items()},
                 "targets": {t.name: {"value": t.formula, "columns": dict(t.columns),
-                                     "threshold": self.thresholds[t.name],
+                                     "threshold": self.thresholds[t.name], "scale": self.scales.get(t.name),
                                      "classes": list(t.classes)} for t in self.targets}}
 
 
@@ -57,10 +70,17 @@ def _read_metadata(csv_path: Path, image_column: str) -> dict[str, dict[str, str
         return {row[image_column]: row for row in reader}
 
 
-def load_dataset(config: AppConfig) -> Dataset:
+def load_dataset(config: AppConfig, folders: tuple[str, ...] | list[str] | None = None,
+                 reference: Dataset | None = None) -> Dataset:
+    """Load image folders (default: ``config.datasets``).
+
+    With ``reference`` (e.g. the training dataset when loading test images),
+    thresholds and scales are taken from it instead of being recomputed, and a
+    target may have a single class.
+    """
     rows: dict[Path, tuple[str, dict[str, str]]] = {}
     groups: dict[str, list[Path]] = {}
-    for folder_name in config.datasets:
+    for folder_name in (config.datasets if folders is None else folders):
         folder = config.data_dir / folder_name
         csv_path = folder.with_suffix(".csv")
         if not folder.is_dir():
@@ -88,7 +108,10 @@ def load_dataset(config: AppConfig) -> Dataset:
             raise ValueError(f"Target {target.name!r}: column {exc} missing from a metadata CSV") from None
         except ValueError:
             raise ValueError(f"Target {target.name!r}: {target.formula} has non-numeric values") from None
-        threshold = statistics.median(values.values()) if target.threshold == "median" else target.threshold
+        if reference is not None:
+            threshold = reference.thresholds[target.name]
+        else:
+            threshold = statistics.median(values.values()) if target.threshold == "median" else target.threshold
         thresholds[target.name] = threshold
         for p, v in values.items():
             scores[p][target.name] = v
@@ -98,8 +121,13 @@ def load_dataset(config: AppConfig) -> Dataset:
                 labels[p][target.name] = int(v)
             else:
                 labels[p][target.name] = int(v > threshold)
-        if len({labels[p][target.name] for p in rows}) < 2:
+        if reference is None and len({labels[p][target.name] for p in rows}) < 2:
             raise ValueError(f"Target {target.name!r}: every image has the same label from {target.formula}, "
                              "so it cannot be classified. Pick another column or threshold.")
+    if reference is not None:
+        scales = dict(reference.scales)
+    else:
+        scales = {t.name: max((abs(scores[p][t.name] - thresholds[t.name]) for p in rows), default=1.0) or 1.0
+                  for t in config.targets if thresholds[t.name] is not None}
     return Dataset({g: [StimulusImage(p, g, labels[p], scores[p]) for p in paths] for g, paths in groups.items()},
-                   config.targets, thresholds)
+                   config.targets, thresholds, scales)

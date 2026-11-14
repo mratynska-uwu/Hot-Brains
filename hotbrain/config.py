@@ -19,6 +19,22 @@ CONFIG: dict[str, Any] = {
     "datasets": ["training/joy", "training/sadness"],
     # Column in the metadata CSV that holds the image file name.
     "image_column": "image_name",
+    # Training/validation split of the datasets above, stratified per folder
+    # and reproducible from the seed. Training sessions use only the training
+    # part; validation sessions show each validation image once.
+    "split": {"validation_fraction": 0.2, "seed": 42},
+    # Subfolders of data_dir for the test session (same CSV convention; the CSV
+    # needs the target columns, e.g. valence and arousal). Not available yet.
+    "test_datasets": ["test"],
+    "test_session": {
+        "trial_s": 15.0,     # how long each test image (and its target) is shown
+        "rest_s": 5.0,       # fixation between test images
+    },
+    # Live valence/arousal decoding shown during validation and test sessions.
+    "feedback": {
+        "update_s": 0.25,    # continuous decoding interval in the test session
+        "smoothing": 0.3,    # exponential smoothing weight of each new estimate (1 = none)
+    },
     "eeg": {
         "sampling_rate": 250,
         "electrodes": ["Fz", "C3", "Cz", "C4", "P3", "Pz", "P4", "Oz"],
@@ -29,13 +45,14 @@ CONFIG: dict[str, Any] = {
         "notch_hz": 50,  # None disables the notch filter
         "bands_hz": {"alpha": [8, 13], "beta": [13, 30], "gamma": [30, 45]},
         # Feature families, computed in this order:
-        #   "band_power"        log power per region x band
+        #   "band_power"        log power per electrode x band
         #   "fractal_dimension" Higuchi fractal dimension per electrode
+        #   "region_band_power" log power averaged over each region x band
         #   "asymmetry"         right-minus-left log power per pair x band
         #   "erp"               mean ERP amplitude per region x window
         "features": ["band_power", "fractal_dimension"],
         "fractal_kmax": 10,
-        # Band power and ERP amplitudes are averaged over each region.
+        # Regions used by "region_band_power" and "erp".
         "regions": {"frontal": ["Fz"], "central": ["C3", "Cz", "C4"],
                     "parietal": ["P3", "Pz", "P4"], "occipital": ["Oz"]},
         # (right, left) pairs used by "asymmetry".
@@ -77,7 +94,7 @@ class EEGSettings:
     fractal_kmax: int = 10
 
     UNICORN_CHANNELS = 8
-    FEATURE_FAMILIES = ("band_power", "fractal_dimension", "asymmetry", "erp")
+    FEATURE_FAMILIES = ("band_power", "fractal_dimension", "region_band_power", "asymmetry", "erp")
 
     @classmethod
     def from_dict(cls, d: dict) -> "EEGSettings":
@@ -183,6 +200,13 @@ class AppConfig:
     targets: tuple[TargetSpec, ...]
     classifiers: tuple[str, ...]
     raw: dict
+    validation_fraction: float = 0.2
+    split_seed: int = 42
+    test_datasets: tuple[str, ...] = ("test",)
+    test_trial_s: float = 15.0
+    test_rest_s: float = 5.0
+    feedback_update_s: float = 0.25
+    feedback_smoothing: float = 0.3
 
     @classmethod
     def from_dict(cls, d: dict, root: Path) -> "AppConfig":
@@ -198,7 +222,18 @@ class AppConfig:
         unknown = [c for c in classifiers if c not in CLASSIFIERS]
         if unknown:
             raise ValueError(f"Unknown classifiers {unknown}; available: {sorted(CLASSIFIERS)}")
+        split = d.get("split", {})
+        fraction = float(split.get("validation_fraction", 0.2))
+        if not 0 <= fraction < 1:
+            raise ValueError("split.validation_fraction must be in [0, 1)")
+        test = d.get("test_session", {})
+        feedback = d.get("feedback", {})
+        trial_s, rest_s = float(test.get("trial_s", 15.0)), float(test.get("rest_s", 5.0))
+        update_s, smoothing = float(feedback.get("update_s", 0.25)), float(feedback.get("smoothing", 0.3))
+        if trial_s <= 0 or rest_s < 0 or update_s <= 0 or not 0 < smoothing <= 1:
+            raise ValueError("test_session/feedback values must be positive (smoothing in (0, 1])")
         data_dir = Path(d.get("data_dir", "data"))
         return cls(data_dir if data_dir.is_absolute() else root / data_dir, datasets,
                    str(d.get("image_column", "image_name")), EEGSettings.from_dict(d["eeg"]),
-                   targets, classifiers, d)
+                   targets, classifiers, d, fraction, int(split.get("seed", 42)),
+                   tuple(str(p) for p in d.get("test_datasets", ("test",))), trial_s, rest_s, update_s, smoothing)
