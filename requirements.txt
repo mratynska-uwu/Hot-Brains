@@ -1,0 +1,6 @@
+PySide6-Essentials>=6.7
+numpy>=2.0
+scipy>=1.14
+scikit-learn>=1.5
+pyqtgraph>=0.13
+gpype>=4.2.0
