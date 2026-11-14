@@ -144,11 +144,11 @@ def test_chosen_key_stops_from_presentation_window(tmp_path: Path, monkeypatch):
         assert [label for _, label in panel.shown] == ["Fz", "C3", "Cz", "C4", "Pz", "PO7", "Oz", "PO8"]
         panel.mode.setCurrentText(panel.MODE_ELECTRODE)
         panel.electrode.setCurrentText("Cz")
-        assert [label for _, label in panel.shown] == ["alpha", "beta", "gamma"]
+        assert [label for _, label in panel.shown] == ["theta", "alpha", "beta", "gamma"]
         panel.mode.setCurrentText(panel.MODE_FD)
         assert len(panel.curves) == len(panel.plots) == 8   # one plot per electrode
         panel.mode.setCurrentText(panel.MODE_ELECTRODE)
-        assert len(panel.plots) == 3                          # one plot per band
+        assert len(panel.plots) == 4                          # one plot per band (theta, alpha, beta, gamma)
         panel.mode.setCurrentText(panel.MODE_FD)
         panel.add(1.0, np.arange(len(window.display_extractor.names), dtype=float))
         assert panel.current.text().startswith("Current values: Fz")
@@ -181,7 +181,7 @@ def test_chosen_key_stops_from_presentation_window(tmp_path: Path, monkeypatch):
             assert window.training.settings_scroll.isHidden()
             assert window.training.accuracy.columnCount() == 6
             assert window.training.accuracy.rowCount() == (1 if key_name == "Escape" else 6)
-            assert all(model.n_features == 12 for model in window.trainer.models.values())
+            assert all(model.n_features == 15 for model in window.trainer.models.values())
             assert window.run_metadata["classifiers"] == (["svm"] if key_name == "Escape" else ["logreg", "svm", "forest"])
             assert len(window.run_metadata["training_model_pairs"]) == (1 if key_name == "Escape" else 6)
             assert window.run_metadata["epoch_end_ms"] == 1700

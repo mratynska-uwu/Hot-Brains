@@ -1,40 +1,62 @@
 """Config-driven, inspectable EEG features.
 
 Band power and fractal dimension (the methods in ``basic_info.md``), plus
-optional hemispheric asymmetry and evoked amplitudes, are common affective EEG
-descriptors. These features are hypotheses, not validated biomarkers. The
-montage, filters, bands, regions and feature families come from
-``hotbrain.config``.
+optional asymmetry, beta/alpha ratio, Hjorth parameters, Katz/Petrosian fractal
+dimensions, variance and evoked amplitudes, are common affective EEG
+descriptors. These features are hypotheses, not validated biomarkers.
+
+``FeatureExtractor`` computes one feature vector for one set of electrodes,
+bands and families. ``TargetFeatures`` holds one extractor per target
+(valence, arousal, ...), as defined by the selected configuration profile, and
+applies the shared re-referencing and artifact rejection.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass
 
 import numpy as np
-from scipy.signal import butter, iirnotch, sosfiltfilt, tf2sos
+from scipy.signal import butter, iirnotch, sosfiltfilt, tf2sos, welch
 
-from .config import EEGSettings
+from .config import EEGSettings, Profile
 
-START_MS = -200          # epoch start relative to image onset (baseline)
-END_BEFORE_OFFSET_MS = 300  # epoch ends this long before the image disappears
+START_MS = -200          # default epoch start relative to image onset (baseline)
+END_BEFORE_OFFSET_MS = 300  # default epoch end: this long before the image disappears
 
 
 @dataclass(frozen=True)
 class EpochSpec:
+    """Sample layout of one epoch.
+
+    The epoch runs from ``start_ms`` (the baseline start) to ``end_ms`` after
+    image onset. ``end_ms`` is ``window_ms`` when set, otherwise the image end
+    minus 300 ms. The baseline is ``start_ms``..``baseline_end_ms``; with
+    ``baseline_end_ms=None`` the whole epoch is de-meaned instead (sustained-state
+    windows have no pre-stimulus period).
+    """
     image_duration_ms: int = 1000
     fs: int = 250
+    window_ms: int | None = None
+    start_ms: int = START_MS
+    baseline_end_ms: int | None = 0
 
     @property
     def end_ms(self) -> int:
-        return self.image_duration_ms - END_BEFORE_OFFSET_MS
+        return self.window_ms if self.window_ms is not None else self.image_duration_ms - END_BEFORE_OFFSET_MS
 
     @property
     def n_samples(self) -> int:
-        return round((self.end_ms - START_MS) * self.fs / 1000)
+        return round((self.end_ms - self.start_ms) * self.fs / 1000)
+
+    @property
+    def onset_index(self) -> int:
+        return max(0, round(-self.start_ms * self.fs / 1000))
 
     @property
     def baseline_samples(self) -> int:
-        return round(-START_MS * self.fs / 1000)
+        """Samples from the epoch start to the end of the baseline (0 = whole-epoch de-mean)."""
+        if self.baseline_end_ms is None:
+            return 0
+        return round((self.baseline_end_ms - self.start_ms) * self.fs / 1000)
 
 
 def make_filter(eeg: EEGSettings) -> np.ndarray:
@@ -44,6 +66,13 @@ def make_filter(eeg: EEGSettings) -> np.ndarray:
         b, a = iirnotch(eeg.notch_hz, Q=30, fs=eeg.fs)
         sos = np.vstack([tf2sos(b, a), sos])
     return sos
+
+
+def clean_epoch(sos: np.ndarray, epoch: np.ndarray, spec: EpochSpec) -> np.ndarray:
+    """Notch + bandpass, then subtract the baseline mean per channel (µV)."""
+    data = sosfiltfilt(sos, np.asarray(epoch, dtype=np.float64), axis=0)
+    baseline = spec.baseline_samples
+    return data - (data[:baseline] if baseline > 0 else data).mean(axis=0)
 
 
 def higuchi_fd(x: np.ndarray, kmax: int = 10) -> float:
@@ -65,10 +94,39 @@ def higuchi_fd(x: np.ndarray, kmax: int = 10) -> float:
     return float(slope)
 
 
+def katz_fd(x: np.ndarray) -> float:
+    """Katz fractal dimension (curve length vs. planar extent)."""
+    x = np.asarray(x, dtype=np.float64)
+    steps = np.abs(np.diff(x))
+    length = steps.sum() + 1e-12
+    mean_step = steps.mean() + 1e-12
+    extent = np.max(np.abs(x[1:] - x[0])) + 1e-12
+    ln = np.log10(length / mean_step)
+    return float(ln / (ln + np.log10(extent / length)))
+
+
+def petrosian_fd(x: np.ndarray) -> float:
+    """Petrosian fractal dimension (from sign changes of the derivative)."""
+    x = np.asarray(x, dtype=np.float64)
+    n = len(x)
+    derivative = np.diff(x)
+    changes = int(np.sum(derivative[1:] * derivative[:-1] < 0))
+    return float(np.log10(n) / (np.log10(n) + np.log10(n / (n + 0.4 * changes))))
+
+
+def hjorth(x: np.ndarray) -> tuple[float, float]:
+    """Hjorth mobility and complexity."""
+    x = np.asarray(x, dtype=np.float64)
+    dx, ddx = np.diff(x), np.diff(x, n=2)
+    var_x, var_dx, var_ddx = np.var(x) + 1e-12, np.var(dx) + 1e-12, np.var(ddx) + 1e-12
+    mobility = np.sqrt(var_dx / var_x)
+    return float(mobility), float(np.sqrt(var_ddx / var_dx) / mobility)
+
+
 @dataclass(frozen=True)
 class FeatureInfo:
-    """What one feature measures, so the GUI can group features for display."""
-    family: str           # band_power, region_band_power, fractal_dimension, asymmetry, erp
+    """What one feature measures, so the GUI and reports can group features."""
+    family: str           # band_power, region_band_power, fractal_dimension, asymmetry, ...
     location: str         # electrode, region or "right-left" pair
     band: str | None      # band name for spectral features, else None
     name: str
@@ -81,6 +139,7 @@ class FeatureExtractor:
         index = {name: i for i, name in enumerate(eeg.electrodes)}
         self._regions = [(name, tuple(index[m] for m in members)) for name, members in eeg.regions]
         self._pairs = [(r, l, index[r], index[l]) for r, l in eeg.asymmetry_pairs]
+        bands = dict(eeg.bands_hz)
         info: list[FeatureInfo] = []
         for family in eeg.features:
             if family == "band_power":
@@ -98,6 +157,23 @@ class FeatureExtractor:
                 for right, left, _, _ in self._pairs:
                     for band, _ in eeg.bands_hz:
                         info.append(FeatureInfo(family, f"{right}-{left}", band, f"{right}-{left} {band} log-power asymmetry"))
+            elif family == "beta_alpha_ratio":
+                if "alpha" in bands and "beta" in bands:
+                    for electrode in eeg.electrodes:
+                        info.append(FeatureInfo(family, electrode, "beta/alpha", f"{electrode} log beta/alpha ratio"))
+            elif family == "hjorth":
+                for electrode in eeg.electrodes:
+                    info.append(FeatureInfo(family, electrode, None, f"{electrode} Hjorth mobility"))
+                    info.append(FeatureInfo(family, electrode, None, f"{electrode} Hjorth complexity"))
+            elif family == "katz_fd":
+                for electrode in eeg.electrodes:
+                    info.append(FeatureInfo(family, electrode, None, f"{electrode} Katz fractal dimension"))
+            elif family == "petrosian_fd":
+                for electrode in eeg.electrodes:
+                    info.append(FeatureInfo(family, electrode, None, f"{electrode} Petrosian fractal dimension"))
+            elif family == "variance":
+                for electrode in eeg.electrodes:
+                    info.append(FeatureInfo(family, electrode, None, f"{electrode} log variance"))
             elif family == "erp":
                 for lo, hi in eeg.erp_windows_ms:
                     for region, _ in self._regions:
@@ -122,28 +198,36 @@ class FeatureExtractor:
             need = max([need, *(hi if hi is not None else lo + 50 for lo, hi in self.eeg.erp_windows_ms)])
         return need + END_BEFORE_OFFSET_MS
 
-    def epoch_spec(self, image_duration_ms: int) -> EpochSpec:
-        if image_duration_ms < self.min_image_duration_ms:
+    def epoch_spec(self, image_duration_ms: int, window_ms: int | None = None,
+                   baseline_ms: tuple[int, int] = (START_MS, 0)) -> EpochSpec:
+        if window_ms is None and image_duration_ms < self.min_image_duration_ms:
             raise ValueError(f"Image duration must be at least {self.min_image_duration_ms / 1000:g} s "
                              "for the configured ERP windows.")
-        return EpochSpec(image_duration_ms, self.eeg.fs)
+        if window_ms is not None and image_duration_ms < window_ms:
+            raise ValueError(f"Image duration must be at least the {window_ms} ms analysis window.")
+        return EpochSpec(image_duration_ms, self.eeg.fs, window_ms, baseline_ms[0], baseline_ms[1])
 
     def clean(self, epoch: np.ndarray, spec: EpochSpec) -> np.ndarray:
-        """Notch + bandpass and subtract the pre-onset per-channel mean, in microvolts."""
+        """Notch + bandpass and subtract the baseline mean per channel, in microvolts."""
         data = np.asarray(epoch, dtype=np.float64)
         expected = (spec.n_samples, len(self.channels))
         if data.shape != expected or not np.isfinite(data).all():
             raise ValueError(f"Expected finite epoch of shape {expected}")
-        data = sosfiltfilt(self.sos, data, axis=0)
-        return data - data[:spec.baseline_samples].mean(axis=0)
+        return clean_epoch(self.sos, data, spec)
+
+    def _spectrum(self, post: np.ndarray, fs: int) -> tuple[np.ndarray, np.ndarray]:
+        if self.eeg.psd_method == "welch":
+            nperseg = min(len(post), fs)
+            return welch(post, fs=fs, window="hann", nperseg=nperseg, noverlap=nperseg // 2, axis=0)
+        spectrum = np.abs(np.fft.rfft(post * np.hanning(len(post))[:, None], axis=0)) ** 2
+        return np.fft.rfftfreq(len(post), 1 / fs), spectrum
 
     def extract(self, epoch: np.ndarray, spec: EpochSpec) -> np.ndarray:
         data = self.clean(epoch, spec)
         fs = spec.fs
-        # Spectral features use the post-onset samples only.
-        post = data[spec.baseline_samples:]
-        spectrum = np.abs(np.fft.rfft(post * np.hanning(len(post))[:, None], axis=0)) ** 2
-        frequencies = np.fft.rfftfreq(len(post), 1 / fs)
+        # Spectral and signal-shape features use the post-onset samples only.
+        post = data[spec.onset_index:]
+        frequencies, spectrum = self._spectrum(post, fs)
 
         def power(lo: float, hi: float, indices: tuple[int, ...]) -> float:
             mask = (frequencies >= lo) & (frequencies < hi)
@@ -151,6 +235,7 @@ class FeatureExtractor:
                 raise ValueError(f"Epoch too short to resolve {lo:g}-{hi:g} Hz")
             return float(np.log10(spectrum[mask][:, indices].mean() + 1e-12))
 
+        bands = dict(self.eeg.bands_hz)
         out: list[float] = []
         for family in self.eeg.features:
             if family == "band_power":
@@ -168,10 +253,26 @@ class FeatureExtractor:
                 for _, _, right, left in self._pairs:
                     for _, (lo, hi) in self.eeg.bands_hz:
                         out.append(power(lo, hi, (right,)) - power(lo, hi, (left,)))
+            elif family == "beta_alpha_ratio":
+                if "alpha" in bands and "beta" in bands:
+                    for channel in range(len(self.channels)):
+                        out.append(power(*bands["beta"], (channel,)) - power(*bands["alpha"], (channel,)))
+            elif family == "hjorth":
+                for channel in post.T:
+                    out.extend(hjorth(channel))
+            elif family == "katz_fd":
+                for channel in post.T:
+                    out.append(katz_fd(channel))
+            elif family == "petrosian_fd":
+                for channel in post.T:
+                    out.append(petrosian_fd(channel))
+            elif family == "variance":
+                for channel in post.T:
+                    out.append(float(np.log10(np.var(channel) + 1e-12)))
             elif family == "erp":
                 for lo_ms, hi_ms in self.eeg.erp_windows_ms:
-                    lo = round((lo_ms - START_MS) * fs / 1000)
-                    hi = round(((spec.end_ms if hi_ms is None else hi_ms) - START_MS) * fs / 1000)
+                    lo = round((lo_ms - spec.start_ms) * fs / 1000)
+                    hi = round(((spec.end_ms if hi_ms is None else hi_ms) - spec.start_ms) * fs / 1000)
                     if hi > len(data) or hi <= lo:
                         raise ValueError(f"ERP window {lo_ms}-{hi_ms} ms does not fit in the epoch")
                     for _, indices in self._regions:
@@ -179,3 +280,96 @@ class FeatureExtractor:
         result = np.asarray(out, dtype=np.float64)
         assert len(result) == len(self.names)
         return result
+
+
+class ArtifactError(ValueError):
+    """The epoch was rejected before feature extraction."""
+
+
+class TargetFeatures:
+    """One feature extractor per target, built from a configuration profile.
+
+    ``positions`` are the GUI-selected model electrodes (indices into the
+    configured montage); each target uses the intersection with its profile
+    electrodes. Epochs passed to :meth:`extract` hold all configured channels.
+    """
+
+    def __init__(self, eeg: EEGSettings, profile: Profile, positions: tuple[int, ...] | None = None):
+        self.eeg = eeg
+        self.profile = profile
+        positions = tuple(range(len(eeg.electrodes))) if positions is None else tuple(positions)
+        allowed = {eeg.electrodes[i] for i in positions}
+        self.extractors: dict[str, FeatureExtractor] = {}
+        self.channel_indices: dict[str, tuple[int, ...]] = {}
+        self.problems: dict[str, str] = {}
+        for target, spec in profile.targets:
+            wanted = set(spec.electrodes or eeg.electrodes)
+            names = tuple(n for n in eeg.electrodes if n in wanted and n in allowed)
+            try:
+                sub = eeg.for_target(names, spec.bands, spec.features)
+            except ValueError as exc:
+                self.problems[target] = str(exc)
+                continue
+            self.extractors[target] = FeatureExtractor(sub)
+            self.channel_indices[target] = tuple(eeg.electrodes.index(n) for n in sub.electrodes)
+        self.union_channels = tuple(sorted({i for idx in self.channel_indices.values() for i in idx}))
+        self.sos = make_filter(eeg)
+
+    @property
+    def targets(self) -> tuple[str, ...]:
+        return tuple(self.extractors)
+
+    @property
+    def names(self) -> dict[str, tuple[str, ...]]:
+        return {t: e.names for t, e in self.extractors.items()}
+
+    def n_features(self) -> dict[str, int]:
+        return {t: len(e.names) for t, e in self.extractors.items()}
+
+    def describe(self) -> dict:
+        return {t: {"electrodes": list(e.eeg.electrodes), "bands": [b for b, _ in e.eeg.bands_hz],
+                    "features": list(e.eeg.features), "n_features": len(e.names)}
+                for t, e in self.extractors.items()}
+
+    @property
+    def min_image_duration_ms(self) -> int:
+        if self.profile.window_ms is not None:
+            return self.profile.window_ms
+        return max((e.min_image_duration_ms for e in self.extractors.values()), default=700)
+
+    def epoch_spec(self, image_duration_ms: int) -> EpochSpec:
+        if image_duration_ms < self.min_image_duration_ms:
+            raise ValueError(f"Image duration must be at least {self.min_image_duration_ms / 1000:g} s "
+                             f"for configuration {self.profile.number}.")
+        return EpochSpec(image_duration_ms, self.eeg.fs, self.profile.window_ms,
+                         self.profile.baseline_ms[0], self.profile.baseline_ms[1])
+
+    def state_spec(self, window_s: float) -> EpochSpec:
+        """Sliding-window layout for sustained states (calibration/test): whole window de-meaned."""
+        window_ms = round(window_s * 1000)
+        return EpochSpec(window_ms, self.eeg.fs, window_ms, 0, None)
+
+    def reference(self, epoch: np.ndarray) -> np.ndarray:
+        data = np.asarray(epoch, dtype=np.float64)
+        if self.eeg.reference == "car":
+            data = data - data.mean(axis=1, keepdims=True)
+        return data
+
+    def check_artifacts(self, epoch: np.ndarray, spec: EpochSpec) -> None:
+        """Raise ArtifactError for flat/non-finite channels or amplitudes above the configured limit."""
+        data = np.asarray(epoch, dtype=np.float64)[:, self.union_channels]
+        if not np.isfinite(data).all():
+            raise ArtifactError("non-finite samples")
+        if np.ptp(data, axis=0).min() < .05:
+            raise ArtifactError("flat channel")
+        limit = self.eeg.artifact_max_abs_uv
+        if limit is not None:
+            peak = float(np.abs(clean_epoch(self.sos, data, spec)).max())
+            if peak > limit:
+                raise ArtifactError(f"amplitude {peak:.0f} µV > {limit:g} µV")
+
+    def extract(self, epoch: np.ndarray, spec: EpochSpec) -> dict[str, np.ndarray]:
+        """Feature vector per target from one epoch of all configured channels."""
+        data = self.reference(epoch)
+        self.check_artifacts(data, spec)
+        return {t: e.extract(data[:, self.channel_indices[t]], spec) for t, e in self.extractors.items()}

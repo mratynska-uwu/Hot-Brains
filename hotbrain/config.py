@@ -38,8 +38,54 @@ CONFIG: dict[str, Any] = {
     # Live valence/arousal decoding shown during validation and test sessions.
     "feedback": {
         "update_s": 0.25,    # continuous decoding interval in the test session
-        "smoothing": 0.3,    # exponential smoothing weight of each new estimate (1 = none)
+        "smoothing": 0.1,    # exponential smoothing weight of each new estimate (1 = none)
+        "on_target_distance": 0.35,  # plane distance counted as "on target" (beep + check mark)
+        "practice_images": 3,        # images in a practice test run (not a measurement)
     },
+    # Calibration session for goal 2: the participant holds the image's emotion
+    # for a whole block; models learn from sliding windows of that sustained
+    # state (instead of the short evoked response) and drive the test session.
+    "calibration": {
+        "blocks": 8,          # images (blocks), balanced across the balance_by groups
+        "block_s": 20.0,      # how long the participant holds each state
+        "rest_s": 5.0,        # fixation between blocks
+        "window_s": 2.0,      # sliding analysis window
+        "step_s": 1.0,        # window step
+        "skip_s": 2.0,        # ignore the first seconds of each block (orienting response)
+        "candidates_per_group": 10,  # most extreme images per group to choose blocks from
+    },
+    # Eyes-open resting recording, saved as the participant's individual reference.
+    "resting": {"duration_s": 90.0},
+    # Optional automatic stop of a training run once a model is good enough.
+    "stop_rule": {"enabled": False, "target": "valence", "balanced_accuracy": 65.0, "min_predictions": 40},
+    # Training-quality report written after every training / calibration run.
+    "report": {"cv_folds": 5, "permutations": 100, "label_issue_threshold": 0.2, "seed": 0},
+    # Two selectable feature configurations (GUI "Configuration"). Each target
+    # has its own electrodes, bands and feature families; electrodes may be
+    # "all" and are further limited by the GUI's model-electrode checkboxes.
+    #   window_ms   analysis window after image onset; None = until 300 ms
+    #               before the image disappears
+    #   baseline_ms pre-onset interval subtracted per channel
+    "profiles": {
+        1: {"name": "Full spectrum · all electrodes",
+            "window_ms": None,
+            "baseline_ms": [-500, -200],
+            "targets": {
+                "valence": {"electrodes": "all", "bands": ["theta", "alpha", "beta", "gamma"],
+                            "features": ["band_power", "fractal_dimension", "asymmetry"]},
+                "arousal": {"electrodes": "all", "bands": ["theta", "alpha", "beta", "gamma"],
+                            "features": ["band_power", "fractal_dimension", "beta_alpha_ratio"]},
+            }},
+        2: {"name": "450 ms · arousal: occipital alpha · valence: fronto-central beta/gamma",
+            "window_ms": 450,
+            "baseline_ms": [-500, -200],
+            "targets": {
+                "arousal": {"electrodes": ["PO7", "Oz", "PO8"], "bands": ["alpha"], "features": ["band_power"]},
+                "valence": {"electrodes": ["Fz", "C3", "Cz", "C4"], "bands": ["beta", "gamma"],
+                            "features": ["band_power"]},
+            }},
+    },
+    "default_profile": 1,
     "eeg": {
         "sampling_rate": 250,
         # Confirmed physical Unicorn Hybrid Black cap: clips 1-8 in this order.
@@ -49,12 +95,25 @@ CONFIG: dict[str, Any] = {
         "device_channels": None,
         "bandpass_hz": [1, 48],
         "notch_hz": 50,  # None disables the notch filter
-        "bands_hz": {"alpha": [8, 13], "beta": [13, 30], "gamma": [30, 45]},
-        # Feature families, computed in this order:
+        "bands_hz": {"theta": [4, 8], "alpha": [8, 13], "beta": [13, 30], "gamma": [30, 45]},
+        # Spectral estimate: "welch" (averaged, steadier for short windows) or "fft".
+        "psd_method": "welch",
+        # Re-reference before feature extraction: None (device reference) or "car"
+        # (common average of the eight channels).
+        "reference": None,
+        # Reject an epoch when any model channel exceeds this absolute amplitude
+        # after filtering and baseline correction (dry electrodes may need more).
+        "artifact_max_abs_uv": 150.0,
+        # Feature families (used by the live feature plot; models use the profiles below):
         #   "band_power"        log power per electrode x band
         #   "fractal_dimension" Higuchi fractal dimension per electrode
         #   "region_band_power" log power averaged over each region x band
         #   "asymmetry"         right-minus-left log power per pair x band
+        #   "beta_alpha_ratio"  log(beta) - log(alpha) per electrode (arousal index)
+        #   "hjorth"            Hjorth mobility and complexity per electrode
+        #   "katz_fd"           Katz fractal dimension per electrode
+        #   "petrosian_fd"      Petrosian fractal dimension per electrode
+        #   "variance"          log variance per electrode
         #   "erp"               mean ERP amplitude per region x window
         "features": ["band_power", "fractal_dimension"],
         "fractal_kmax": 10,
@@ -78,7 +137,10 @@ CONFIG: dict[str, Any] = {
     # "negative_mean": -1}} instead.
     "targets": {
         "valence": {"column": "valence", "threshold": 0, "classes": ["negative", "positive"]},
-        "arousal": {"column": "arousal", "threshold": "median", "classes": ["low", "high"]},
+        # exclude_middle: drop the middle share of images (by the training images'
+        # quantiles) from this target's training, keeping only clearly low/high ones.
+        "arousal": {"column": "arousal", "threshold": "median", "classes": ["low", "high"],
+                    "exclude_middle": 1 / 3},
     },
     # Keys from hotbrain.classifiers.CLASSIFIERS selected by default in the GUI.
     "classifiers": ["logreg"],
@@ -98,9 +160,31 @@ class EEGSettings:
     erp_windows_ms: tuple[tuple[int, int | None], ...]
     features: tuple[str, ...] = ("band_power", "fractal_dimension")
     fractal_kmax: int = 10
+    psd_method: str = "welch"
+    reference: str | None = None
+    artifact_max_abs_uv: float | None = 150.0
 
     UNICORN_CHANNELS = 8
-    FEATURE_FAMILIES = ("band_power", "fractal_dimension", "region_band_power", "asymmetry", "erp")
+    FEATURE_FAMILIES = ("band_power", "fractal_dimension", "region_band_power", "asymmetry", "erp",
+                        "beta_alpha_ratio", "hjorth", "katz_fd", "petrosian_fd", "variance")
+
+    def for_target(self, electrodes: tuple[str, ...], bands: tuple[str, ...],
+                   features: tuple[str, ...]) -> "EEGSettings":
+        """Settings for one target: a subset of electrodes, bands and feature families."""
+        positions = tuple(i for i, name in enumerate(self.electrodes) if name in set(electrodes))
+        if not positions:
+            raise ValueError("No electrodes left for this target")
+        selected = self.select_electrodes(positions)
+        band_set = set(bands)
+        kept_bands = tuple((name, edges) for name, edges in self.bands_hz if name in band_set)
+        if not kept_bands:
+            raise ValueError("No bands left for this target")
+        families = tuple(f for f in features if f != "asymmetry" or selected.asymmetry_pairs)
+        if "beta_alpha_ratio" in families and not {"alpha", "beta"} <= band_set:
+            families = tuple(f for f in families if f != "beta_alpha_ratio")
+        if not families:
+            raise ValueError("No feature families left for this target")
+        return replace(selected, bands_hz=kept_bands, features=families)
 
     def select_electrodes(self, positions: tuple[int, ...]) -> "EEGSettings":
         """Build model settings for a subset while preserving physical channel order."""
@@ -163,8 +247,16 @@ class EEGSettings:
         kmax = int(d.get("fractal_kmax", 10))
         if kmax < 2:
             raise ValueError("eeg.fractal_kmax must be at least 2")
+        psd = str(d.get("psd_method", "welch"))
+        if psd not in ("welch", "fft"):
+            raise ValueError("eeg.psd_method must be 'welch' or 'fft'")
+        reference = d.get("reference")
+        if reference not in (None, "car"):
+            raise ValueError("eeg.reference must be None or 'car'")
+        threshold = d.get("artifact_max_abs_uv", 150.0)
+        threshold = None if threshold is None else float(threshold)
         return cls(fs, electrodes, channels, (low, high), None if notch is None else float(notch),
-                   bands, regions, pairs, windows, features, kmax)
+                   bands, regions, pairs, windows, features, kmax, psd, reference, threshold)
 
     def warnings(self) -> list[str]:
         low, high = self.bandpass_hz
@@ -184,6 +276,7 @@ class TargetSpec:
     columns: tuple[tuple[str, float], ...]  # value = sum(weight * column)
     threshold: float | str | None
     classes: tuple[str, str]
+    exclude_middle: float = 0.0   # share of images around the threshold left out of training
 
     @classmethod
     def from_dict(cls, name: str, d: dict) -> "TargetSpec":
@@ -199,7 +292,10 @@ class TargetSpec:
         classes = tuple(str(c) for c in d.get("classes", ("0", "1")))
         if len(classes) != 2:
             raise ValueError(f"targets.{name}.classes must have exactly two names (label 0, label 1)")
-        return cls(str(name), columns, threshold, classes)
+        exclude = float(d.get("exclude_middle", 0.0) or 0.0)
+        if not 0 <= exclude < 1 or (exclude and threshold is None):
+            raise ValueError(f"targets.{name}.exclude_middle must be in [0, 1) and needs a threshold")
+        return cls(str(name), columns, threshold, classes, exclude)
 
     @property
     def formula(self) -> str:
@@ -213,6 +309,54 @@ class TargetSpec:
 
     def value(self, row: dict[str, str]) -> float:
         return sum(weight * float(row[column]) for column, weight in self.columns)
+
+
+@dataclass(frozen=True)
+class TargetFeatureSpec:
+    electrodes: tuple[str, ...] | None   # None = all configured electrodes
+    bands: tuple[str, ...]
+    features: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class Profile:
+    """One selectable feature configuration ("Configuration 1/2" in the GUI)."""
+    number: int
+    name: str
+    window_ms: int | None
+    baseline_ms: tuple[int, int]
+    targets: tuple[tuple[str, TargetFeatureSpec], ...]
+
+    def target(self, name: str) -> TargetFeatureSpec:
+        return dict(self.targets)[name]
+
+    @classmethod
+    def from_dict(cls, number: int, d: dict, eeg: EEGSettings, target_names: list[str]) -> "Profile":
+        window = d.get("window_ms")
+        window = None if window is None else int(window)
+        if window is not None and window < 100:
+            raise ValueError(f"profiles.{number}.window_ms must be at least 100 ms")
+        b0, b1 = (int(v) for v in d.get("baseline_ms", (-200, 0)))
+        if not b0 < b1 <= 0:
+            raise ValueError(f"profiles.{number}.baseline_ms must be [start < end <= 0]")
+        band_names = {name for name, _ in eeg.bands_hz}
+        specs = []
+        for target in target_names:
+            t = d.get("targets", {}).get(target)
+            if t is None:
+                raise ValueError(f"profiles.{number} has no feature spec for target {target!r}")
+            electrodes = t.get("electrodes", "all")
+            electrodes = None if electrodes == "all" else tuple(str(e) for e in electrodes)
+            if electrodes is not None and (not electrodes or set(electrodes) - set(eeg.electrodes)):
+                raise ValueError(f"profiles.{number}.{target}.electrodes must be 'all' or configured electrodes")
+            bands = tuple(str(b) for b in t.get("bands", band_names))
+            if not bands or set(bands) - band_names:
+                raise ValueError(f"profiles.{number}.{target}.bands must name configured bands {sorted(band_names)}")
+            features = tuple(str(f) for f in t.get("features", ("band_power",)))
+            if not features or set(features) - set(EEGSettings.FEATURE_FAMILIES):
+                raise ValueError(f"profiles.{number}.{target}.features must come from {EEGSettings.FEATURE_FAMILIES}")
+            specs.append((target, TargetFeatureSpec(electrodes, bands, features)))
+        return cls(int(number), str(d.get("name", f"Configuration {number}")), window, (b0, b1), tuple(specs))
 
 
 @dataclass(frozen=True)
@@ -234,6 +378,20 @@ class AppConfig:
     # Explicit metadata CSV per image folder (folders not listed use <folder>.csv).
     dataset_metadata: tuple[tuple[str, str], ...] = ()
     balance_by: str | None = None
+    profiles: tuple[Profile, ...] = ()
+    default_profile: int = 1
+    calibration: dict | None = None
+    resting_s: float = 90.0
+    stop_rule: dict | None = None
+    report: dict | None = None
+    on_target_distance: float = 0.35
+    practice_images: int = 3
+
+    def profile(self, number: int) -> Profile:
+        for profile in self.profiles:
+            if profile.number == number:
+                return profile
+        raise KeyError(f"No configuration {number}")
 
     @property
     def n_trial_groups(self) -> int:
@@ -288,8 +446,28 @@ class AppConfig:
         if trial_s <= 0 or rest_s < 0 or update_s <= 0 or not 0 < smoothing <= 1:
             raise ValueError("test_session/feedback values must be positive (smoothing in (0, 1])")
         data_dir = Path(d.get("data_dir", "data"))
+        eeg = EEGSettings.from_dict(d["eeg"])
+        target_names = [t.name for t in targets]
+        default_profile_dict = {"name": "Default", "window_ms": None, "baseline_ms": [-200, 0],
+                                "targets": {n: {"electrodes": "all", "bands": [b for b, _ in eeg.bands_hz],
+                                                "features": list(eeg.features)} for n in target_names}}
+        raw_profiles = d.get("profiles") or {1: default_profile_dict}
+        profiles = tuple(Profile.from_dict(int(k), v, eeg, target_names) for k, v in sorted(raw_profiles.items(),
+                                                                                         key=lambda kv: int(kv[0])))
+        default_profile = int(d.get("default_profile", profiles[0].number))
+        if default_profile not in {p.number for p in profiles}:
+            raise ValueError("default_profile must be one of the configured profiles")
+        calibration = {"blocks": 8, "block_s": 20.0, "rest_s": 5.0, "window_s": 2.0, "step_s": 1.0,
+                       "skip_s": 2.0, "candidates_per_group": 10, **d.get("calibration", {})}
+        if calibration["window_s"] + calibration["skip_s"] > calibration["block_s"] or calibration["step_s"] <= 0:
+            raise ValueError("calibration needs window_s + skip_s <= block_s and step_s > 0")
+        stop_rule = {"enabled": False, "target": target_names[0], "balanced_accuracy": 65.0,
+                     "min_predictions": 40, **d.get("stop_rule", {})}
+        report = {"cv_folds": 5, "permutations": 100, "label_issue_threshold": 0.2, "seed": 0, **d.get("report", {})}
         return cls(data_dir if data_dir.is_absolute() else root / data_dir, datasets,
-                   str(d.get("image_column", "image_name")), EEGSettings.from_dict(d["eeg"]),
+                   str(d.get("image_column", "image_name")), eeg,
                    targets, classifiers, d, fraction, int(split.get("seed", 42)),
                    test_datasets, trial_s, rest_s, update_s, smoothing,
-                   dataset_metadata + test_metadata, balance_by)
+                   dataset_metadata + test_metadata, balance_by, profiles, default_profile, calibration,
+                   float(d.get("resting", {}).get("duration_s", 90.0)), stop_rule, report,
+                   float(feedback.get("on_target_distance", 0.35)), int(feedback.get("practice_images", 3)))

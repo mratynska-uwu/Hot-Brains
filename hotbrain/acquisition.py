@@ -159,7 +159,7 @@ class SampleRing:
                 return None, "waiting_marker"
             first = (marker + self.device_delay_samples
                      - round(paint_to_marker_ms * self.fs / 1000)
-                     + round(START_MS * self.fs / 1000))
+                     + round(getattr(spec, "start_ms", START_MS) * self.fs / 1000))
             last = first + spec.n_samples
             if first < self._blocks[0][0]:
                 return None, "expired_epoch"

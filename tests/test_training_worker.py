@@ -154,7 +154,7 @@ def test_validation_uses_frozen_models_when_no_training_pairs_are_selected(tmp_p
             time.sleep(.01)
         assert window.training_future is None
         assert window.trial_log[0]["eeg"] == "usable"
-        assert len(window.extractor.names) == 12
+        assert len(window.extractor.names) == 15
         assert window.validation.accuracy(("valence", "logreg"))[2] == 1
         assert window.run_metadata["training_model_pairs"] == []
     finally:

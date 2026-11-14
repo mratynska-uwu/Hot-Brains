@@ -80,7 +80,7 @@ def test_config_matches_basic_info():
     assert EEG.asymmetry_pairs == (("C4", "C3"), ("PO8", "PO7"))
     assert EEG.bandpass_hz == (1, 48)
     assert EEG.notch_hz == 50
-    assert [name for name, _ in EEG.bands_hz] == ["alpha", "beta", "gamma"]
+    assert [name for name, _ in EEG.bands_hz] == ["theta", "alpha", "beta", "gamma"]
     assert EEG.features == ("band_power", "fractal_dimension")
     assert EEG.warnings() == []  # gamma 30-45 Hz fits inside the 1-48 Hz bandpass
     narrow = copy.deepcopy(CONFIG["eeg"])
@@ -121,8 +121,11 @@ def test_real_dataset_loads_with_valence_and_arousal_labels():
     assert np.isclose(first.values["arousal"], float(rows[first.path.name]["arousal"]))
     # CSV rows whose image file is absent are skipped and reported, not fatal.
     assert dataset.rows_without_image == sorted(set(rows) - {i.path.name for i in negative + positive})
-    arousal = [i.labels["arousal"] for i in negative + positive]
+    arousal = [i.labels["arousal"] for i in negative + positive if i.labels["arousal"] is not None]
     assert 0 < sum(arousal) < len(arousal)
+    # exclude_middle drops about a third of the images from arousal training
+    excluded = sum(i.labels["arousal"] is None for i in negative + positive)
+    assert abs(excluded / len(negative + positive) - 1 / 3) < .02
     assert dataset.thresholds["arousal"] is not None
 
 
@@ -167,6 +170,7 @@ def test_dataset_folders_are_a_parameter_and_constant_targets_are_rejected(tmp_p
                               "a/neg": [("n1.png", 0, 1.0)]})
     config = copy.deepcopy(CONFIG)
     config["datasets"] = ["a/pos", "a/neg"]
+    config["targets"]["arousal"]["exclude_middle"] = 0
     dataset = load_dataset(AppConfig.from_dict(config, tmp_path))
     assert {i.path.name: i.labels["arousal"] for g in dataset.groups.values() for i in g} == \
         {"p1.png": 0, "p2.png": 1, "n1.png": 0}
@@ -215,7 +219,7 @@ def test_selected_electrodes_preserve_device_mapping_and_drop_unavailable_asymme
     assert selected.electrodes == ("Fz", "Cz", "PO8")
     assert selected.device_channels == (0, 2, 7)
     extractor = FeatureExtractor(selected)
-    assert len(extractor.names) == 12
+    assert len(extractor.names) == 15   # 3 electrodes x 4 bands + 3 fractal dimensions
     assert set(info.location for info in extractor.info) == {"Fz", "Cz", "PO8"}
     extended = copy.deepcopy(CONFIG["eeg"])
     extended["features"].append("asymmetry")
@@ -228,10 +232,10 @@ def test_features_follow_config():
     extractor = FeatureExtractor(EEG)
     spec = extractor.epoch_spec(1000)
     features = extractor.extract(np.random.default_rng(3).normal(0, 4, (spec.n_samples, N_CH)), spec)
-    # 8 electrodes x 3 bands of log power + 8 per-electrode fractal dimensions
-    assert features.shape == (len(extractor.names),) == (32,)
+    # 8 electrodes x 4 bands of log power + 8 per-electrode fractal dimensions
+    assert features.shape == (len(extractor.names),) == (40,)
     assert len(extractor.indices("band_power", band="gamma")) == 8
-    assert [extractor.info[i].band for i in extractor.indices("band_power", location="Oz")] == ["alpha", "beta", "gamma"]
+    assert [extractor.info[i].band for i in extractor.indices("band_power", location="Oz")] == ["theta", "alpha", "beta", "gamma"]
     assert [extractor.info[i].location for i in extractor.indices("fractal_dimension")] == list(EEG.electrodes)
     with pytest.raises(ValueError):
         extractor.epoch_spec(600)
@@ -243,8 +247,8 @@ def test_optional_feature_families():
     extractor = FeatureExtractor(EEGSettings.from_dict(eeg))
     spec = extractor.epoch_spec(1000)
     features = extractor.extract(np.random.default_rng(5).normal(0, 4, (spec.n_samples, N_CH)), spec)
-    # + 4 regions x 3 bands + 2 pairs x 3 bands of asymmetry + 3 ERP windows x 4 regions
-    assert features.shape == (32 + 12 + 6 + 12,)
+    # + 4 regions x 4 bands + 2 pairs x 4 bands of asymmetry + 3 ERP windows x 4 regions
+    assert features.shape == (40 + 16 + 8 + 12,)
     # A single-electrode region averages the same spectrum as that electrode.
     fz = extractor.indices("band_power", location="Fz")
     frontal = extractor.indices("region_band_power", location="frontal")
