@@ -1,5 +1,6 @@
 """The stop shortcut must work from a detached participant window."""
 
+import copy
 import os
 from pathlib import Path
 
@@ -11,13 +12,14 @@ from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication
 
 import hotbrain.gui as gui
+from hotbrain.config import CONFIG
 
 
 class NoDevice(QObject):
     status_changed = Signal(str)
     connected_changed = Signal(bool)
 
-    def __init__(self, serial):
+    def __init__(self, eeg, serial):
         super().__init__()
         self.connected = False
         self.oscar = False
@@ -34,16 +36,23 @@ class NoDevice(QObject):
 
 def test_chosen_key_stops_from_detached_presentation(tmp_path: Path, monkeypatch):
     monkeypatch.setattr(gui, "DeviceManager", NoDevice)
-    for label in ("happy", "sad"):
-        folder = tmp_path / "training_dataset" / f"{label}_images"
+    for folder_name, positive, aroused in (("set/happy", 1, (1.0, 3.0)), ("set/sad", 0, (2.0, 4.0))):
+        folder = tmp_path / "data" / folder_name
         folder.mkdir(parents=True)
-        assert QImage(12, 12, QImage.Format.Format_RGB32).save(str(folder / "sample.png"))
+        lines = ["image_name,positive_mean,negative_mean,aroused_mean"]
+        for i, value in enumerate(aroused):
+            assert QImage(12, 12, QImage.Format.Format_RGB32).save(str(folder / f"sample{i}.png"))
+            lines.append(f"sample{i}.png,{5 if positive else 2},{2 if positive else 5},{value}")
+        folder.with_suffix(".csv").write_text("\n".join(lines), encoding="utf-8")
+    config = copy.deepcopy(CONFIG)
+    config["datasets"] = ["set/happy", "set/sad"]
 
     app = QApplication.instance() or QApplication([])
-    window = gui.MainWindow(tmp_path)
+    window = gui.MainWindow(tmp_path, config)
     window.show()
     window.training.warmup.setChecked(False)
     try:
+        assert window.dataset is not None, window.training.dataset_status.text()
         assert len(window.features.quality_map.POSITIONS) == 8
         assert all(rating.good is None for rating in window.features.quality_map.ratings)
         assert not window.features.quality_map.grab().isNull()
@@ -56,6 +65,7 @@ def test_chosen_key_stops_from_detached_presentation(tmp_path: Path, monkeypatch
             window.start_run()
             app.processEvents()
             assert window.active
+            assert window.training.accuracy.rowCount() == 4  # 2 targets x 2 default classifiers
             assert window.run_metadata["epoch_end_ms"] == 1700
             assert window.run_metadata["fixation_min_s"] == 2.0
             assert window.run_metadata["fixation_max_s"] == 4.0

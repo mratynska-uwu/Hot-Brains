@@ -1,4 +1,8 @@
-"""Trial allocation and prequential (test-before-train) classifier."""
+"""Trial allocation and prequential (test-before-train) classifiers.
+
+One model is trained per (target, classifier) pair, e.g. valence/logreg,
+valence/svm, arousal/logreg, arousal/svm, all on the same EEG feature vectors.
+"""
 from __future__ import annotations
 
 import json
@@ -6,112 +10,145 @@ import random
 from dataclasses import dataclass
 from pathlib import Path
 
+import joblib
 import numpy as np
-from sklearn.linear_model import LogisticRegression
-from sklearn.pipeline import make_pipeline
-from sklearn.preprocessing import StandardScaler
 
-from .features import CHANNELS, FEATURE_NAMES, FS
+from . import classifiers
+from .dataset import StimulusImage
 
-IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".bmp", ".webp", ".gif"}
-
-
-def image_files(root: Path) -> dict[str, list[Path]]:
-    groups = {}
-    for label in ("happy", "sad"):
-        folder = root / "training_dataset" / f"{label}_images"
-        groups[label] = sorted(p for p in folder.iterdir() if p.is_file() and p.suffix.lower() in IMAGE_SUFFIXES) if folder.exists() else []
-    return groups
+MIN_TRIALS = 10
+ROLLING = 20
 
 
 class TrialPlan:
-    def __init__(self, images: dict[str, list[Path]], total: int | None, rng: random.Random | None = None):
-        if not all(images.values()):
-            raise ValueError("Put at least one image in each happy_images and sad_images folder.")
-        if total is not None and (total < 2 or total % 2):
-            raise ValueError("The finite trial count must be positive and even for exact balance.")
+    """Balanced across dataset folders; each folder cycles its images before repeating."""
+
+    def __init__(self, groups: dict[str, list[StimulusImage]], total: int | None, rng: random.Random | None = None):
+        if not groups or not all(groups.values()):
+            raise ValueError("Every dataset folder needs at least one image.")
+        names = list(groups)
+        if total is not None and (total < len(names) or total % len(names)):
+            raise ValueError(f"The finite trial count must be a positive multiple of {len(names)} "
+                             "(the number of dataset folders) for exact balance.")
         self.rng = rng or random.Random()
-        self.images = images
+        self.groups = groups
+        self.names = names
         self.total = total
-        self.labels = (["happy", "sad"] * (total // 2)) if total else []
-        self.rng.shuffle(self.labels)
-        self.queues: dict[str, list[Path]] = {k: [] for k in images}
-        self.previous: dict[str, Path | None] = {k: None for k in images}
+        self.order = (names * (total // len(names))) if total else []
+        self.rng.shuffle(self.order)
+        self.queues: dict[str, list[StimulusImage]] = {k: [] for k in groups}
+        self.previous: dict[str, StimulusImage | None] = {k: None for k in groups}
         self.index = 0
 
-    def next(self) -> tuple[str, Path] | None:
+    def next(self) -> StimulusImage | None:
         if self.total is not None and self.index >= self.total:
             return None
-        label = self.labels[self.index] if self.total else self.rng.choice(("happy", "sad"))
+        group = self.order[self.index] if self.total else self.rng.choice(self.names)
         self.index += 1
-        queue = self.queues[label]
+        queue = self.queues[group]
         if not queue:
-            queue.extend(self.images[label])
+            queue.extend(self.groups[group])
             self.rng.shuffle(queue)
-            if len(queue) > 1 and queue[-1] == self.previous[label]:
+            if len(queue) > 1 and queue[-1] == self.previous[group]:
                 queue[0], queue[-1] = queue[-1], queue[0]
-        path = queue.pop()
-        self.previous[label] = path
-        return label, path
+        item = queue.pop()
+        self.previous[group] = item
+        return item
 
 
 @dataclass
 class Prediction:
-    label: str
-    probability_happy: float
+    label: int
+    probability: float | None  # P(label 1), when the classifier provides it
     correct: bool
 
 
 class OnlineTrainer:
-    """Refit fast L2 logistic regression after each held-out prediction."""
+    """Refit one classifier after each held-out prediction."""
 
-    def __init__(self):
+    def __init__(self, classifier: str, n_features: int):
+        self.classifier = classifier
+        self.n_features = n_features
         self.x: list[np.ndarray] = []
         self.y: list[int] = []
         self.model = None
         self.predictions: list[Prediction] = []
 
-    def add(self, features: np.ndarray, label: str) -> Prediction | None:
+    def add(self, features: np.ndarray, label: int) -> Prediction | None:
         features = np.asarray(features, dtype=np.float64)
-        if features.shape != (len(FEATURE_NAMES),) or not np.isfinite(features).all():
+        if features.shape != (self.n_features,) or not np.isfinite(features).all():
             raise ValueError("Invalid EEG feature vector")
-        target = int(label == "happy")
         prediction = None
         if self.model is not None:
-            p = float(self.model.predict_proba(features[None, :])[0, 1])
-            prediction = Prediction("happy" if p >= 0.5 else "sad", p, (p >= 0.5) == bool(target))
+            predicted = int(self.model.predict(features[None, :])[0])
+            probability = None
+            if hasattr(self.model, "predict_proba"):
+                probability = float(self.model.predict_proba(features[None, :])[0, 1])
+            prediction = Prediction(predicted, probability, predicted == label)
             self.predictions.append(prediction)
         self.x.append(features)
-        self.y.append(target)
-        if len(self.x) >= 10 and len(set(self.y)) == 2:
-            self.model = make_pipeline(StandardScaler(), LogisticRegression(C=1.0, max_iter=1000, solver="liblinear"))
-            self.model.fit(np.vstack(self.x), np.asarray(self.y))
+        self.y.append(int(label))
+        if len(self.x) >= MIN_TRIALS and len(set(self.y)) == 2 and min(self.y.count(0), self.y.count(1)) >= 2:
+            model = classifiers.build(self.classifier)
+            model.fit(np.vstack(self.x), np.asarray(self.y))
+            self.model = model
         return prediction
 
     @property
     def rolling_accuracy(self) -> float | None:
-        last = self.predictions[-20:]
+        last = self.predictions[-ROLLING:]
         return 100 * sum(p.correct for p in last) / len(last) if last else None
 
-    def save(self, stem: Path, metadata: dict) -> tuple[Path, Path]:
-        if self.model is None:
-            raise ValueError("At least 10 usable EEG trials with both labels are needed to save a fitted model.")
-        scaler, classifier = self.model.steps[0][1], self.model.steps[1][1]
-        weights_path = stem.with_suffix(".npz")
+
+class MultiTrainer:
+    """All (target, classifier) models trained side by side on the same epochs."""
+
+    def __init__(self, targets: list[str], classifier_keys: list[str], n_features: int):
+        self.targets = list(targets)
+        self.classifier_keys = list(classifier_keys)
+        self.models: dict[tuple[str, str], OnlineTrainer] = {
+            (t, c): OnlineTrainer(c, n_features) for t in self.targets for c in self.classifier_keys}
+
+    def add(self, features: np.ndarray, labels: dict[str, int]) -> dict[tuple[str, str], Prediction]:
+        out = {}
+        for (target, clf), trainer in self.models.items():
+            prediction = trainer.add(features, labels[target])
+            if prediction is not None:
+                out[(target, clf)] = prediction
+        return out
+
+    @property
+    def any_fitted(self) -> bool:
+        return any(t.model is not None for t in self.models.values())
+
+    def save(self, stem: Path, metadata: dict) -> list[Path]:
+        if not self.any_fitted:
+            raise ValueError(f"At least {MIN_TRIALS} usable EEG trials with both labels are needed to save a fitted model.")
+        written = []
+        summary = {}
+        for (target, clf), trainer in self.models.items():
+            entry = {"classifier": classifiers.CLASSIFIERS[clf].label, "n_eeg_trials": len(trainer.x),
+                     "n_predictions": len(trainer.predictions), "rolling_accuracy": trainer.rolling_accuracy,
+                     "model_file": None}
+            if trainer.model is not None:
+                path = stem.with_name(f"{stem.name}.{target}.{clf}.joblib")
+                joblib.dump(trainer.model, path)
+                entry["model_file"] = path.name
+                written.append(path)
+            summary[f"{target}/{clf}"] = entry
         metadata_path = stem.with_suffix(".json")
-        np.savez_compressed(weights_path, mean=scaler.mean_, scale=scaler.scale_,
-                            coefficients=classifier.coef_[0], intercept=classifier.intercept_[0])
-        record = {**metadata, "schema": 1, "fs": FS, "channels": CHANNELS,
-                  "feature_names": FEATURE_NAMES, "n_eeg_trials": len(self.x),
-                  "n_predictions": len(self.predictions), "rolling_accuracy": self.rolling_accuracy,
-                  "model": "StandardScaler + L2 logistic regression", "class_1": "happy"}
+        record = {**metadata, "schema": 2, "models": summary}
         metadata_path.write_text(json.dumps(record, indent=2, default=str), encoding="utf-8")
-        return weights_path, metadata_path
+        return [metadata_path, *written]
 
 
-def predict_saved(stem: Path, features: np.ndarray) -> float:
-    """Safe inference helper: P(happy) using numeric weights, without pickle."""
-    with np.load(stem.with_suffix(".npz"), allow_pickle=False) as data:
-        z = (np.asarray(features) - data["mean"]) / data["scale"]
-        logit = float(z @ data["coefficients"] + data["intercept"])
-    return float(1 / (1 + np.exp(-np.clip(logit, -50, 50))))
+def predict_saved(model_path: Path, features: np.ndarray) -> float:
+    """P(label 1) from a saved model, or its 0/1 prediction if it has no probabilities (SVM).
+
+    joblib uses pickle: only load files you created.
+    """
+    model = joblib.load(model_path)
+    features = np.asarray(features, dtype=np.float64)[None, :]
+    if hasattr(model, "predict_proba"):
+        return float(model.predict_proba(features)[0, 1])
+    return float(model.predict(features)[0])

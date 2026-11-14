@@ -1,1 +1,1 @@
-"""Scene-valence EEG training application."""
+"""Scene emotion (valence/arousal) EEG training application."""

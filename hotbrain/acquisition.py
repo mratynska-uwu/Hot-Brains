@@ -13,11 +13,16 @@ from collections import deque
 import numpy as np
 from PySide6.QtCore import QObject, QTimer, Signal
 
-from .features import DEFAULT_EPOCH, EpochSpec, FS, START_MS
+from .config import EEGSettings
+from .features import EpochSpec, START_MS
 
 
 class SampleRing:
-    def __init__(self, retention_s: float = 20):
+    """Keeps the configured electrodes (device_channels) of the last seconds of EEG."""
+
+    def __init__(self, retention_s: float = 20, fs: int = 250, channels: tuple[int, ...] = tuple(range(8))):
+        self.fs = fs
+        self.channels = list(channels)
         self._lock = threading.Lock()
         self._blocks: deque[tuple[np.ndarray, np.ndarray]] = deque()
         self._latest = 0.0
@@ -25,14 +30,14 @@ class SampleRing:
         self.retention_s = retention_s
 
     def append(self, frame: np.ndarray, delay_s: float):
-        values = np.asarray(frame[:, :8], dtype=np.float64).copy()
+        values = np.asarray(frame, dtype=np.float64)[:, self.channels].copy()
         observed_end = time.perf_counter() - delay_s
         with self._lock:
             # Bluetooth frames arrive in bursts. Re-timestamping every frame
             # from callback time creates artificial 20-70 ms gaps. Anchor the
-            # first frame, then advance by the amplifier's fixed 250 Hz rate.
-            end = observed_end if self._end_time is None else self._end_time + len(values) / FS
-            times = end - np.arange(len(values) - 1, -1, -1) / FS
+            # first frame, then advance by the amplifier's fixed sampling rate.
+            end = observed_end if self._end_time is None else self._end_time + len(values) / self.fs
+            times = end - np.arange(len(values) - 1, -1, -1) / self.fs
             self._blocks.append((times, values))
             self._latest = end
             self._end_time = end
@@ -48,11 +53,11 @@ class SampleRing:
         with self._lock:
             blocks = [(t.copy(), x.copy()) for t, x in self._blocks if t[-1] >= self._latest - seconds]
         if not blocks:
-            return np.empty(0), np.empty((0, 8))
+            return np.empty(0), np.empty((0, len(self.channels)))
         return np.concatenate([b[0] for b in blocks]), np.concatenate([b[1] for b in blocks])
 
-    def epoch(self, onset: float, spec: EpochSpec = DEFAULT_EPOCH) -> np.ndarray | None:
-        targets = onset + (START_MS / 1000) + np.arange(spec.n_samples) / FS
+    def epoch(self, onset: float, spec: EpochSpec) -> np.ndarray | None:
+        targets = onset + (START_MS / 1000) + np.arange(spec.n_samples) / spec.fs
         with self._lock:
             blocks = [(t.copy(), x.copy()) for t, x in self._blocks if t[-1] >= targets[0] - 0.1 and t[0] <= targets[-1] + 0.1]
         if not blocks:
@@ -67,9 +72,9 @@ class SampleRing:
             return None
         # A Bluetooth dropout cannot be safely interpolated into an epoch.
         inside = (times >= targets[0] - .02) & (times <= targets[-1] + .02)
-        if np.diff(times[inside]).max(initial=0) > .025:
+        if np.diff(times[inside]).max(initial=0) > 6 / spec.fs:
             return None
-        return np.column_stack([np.interp(targets, times, values[:, ch]) for ch in range(8)])
+        return np.column_stack([np.interp(targets, times, values[:, ch]) for ch in range(values.shape[1])])
 
 
 class DeviceManager(QObject):
@@ -78,10 +83,11 @@ class DeviceManager(QObject):
     _attempt_succeeded = Signal(object, object, int)
     _attempt_failed = Signal(str, int)
 
-    def __init__(self, serial: str | None = None):
+    def __init__(self, eeg: EEGSettings, serial: str | None = None):
         super().__init__()
+        self.eeg = eeg
         self.retention_s = 20.0
-        self.ring = SampleRing(self.retention_s)
+        self.ring = self._new_ring()
         self.pipeline = None
         self.source = None
         self.connected = False
@@ -109,6 +115,9 @@ class DeviceManager(QObject):
             self.disconnect()
             self._last_attempt = 0
             self._tick()
+
+    def _new_ring(self) -> SampleRing:
+        return SampleRing(self.retention_s, self.eeg.fs, self.eeg.device_channels)
 
     def set_retention(self, seconds: float):
         self.retention_s = max(20.0, seconds)
@@ -149,7 +158,7 @@ class DeviceManager(QObject):
                     frame = data.get("in")
                     if generation == manager._generation and frame is not None and len(frame):
                         oscar_samples = source.oscar_delay_samples or 0
-                        manager.ring.append(frame, .040 + oscar_samples / FS)
+                        manager.ring.append(frame, .040 + oscar_samples / manager.eeg.fs)
                     return {}
 
             pipeline = gp.Pipeline()
@@ -205,7 +214,7 @@ class DeviceManager(QObject):
                 pass
         self.pipeline = None
         self.source = None
-        self.ring = SampleRing(self.retention_s)
+        self.ring = self._new_ring()
         if was_connected:
             self.connected_changed.emit(False)
 

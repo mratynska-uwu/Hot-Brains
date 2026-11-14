@@ -17,10 +17,15 @@ from PySide6.QtWidgets import (
     QWidget, QTableWidget, QTableWidgetItem, QToolTip,
 )
 
+from . import classifiers
 from .acquisition import DeviceManager
-from .features import CHANNELS, DEFAULT_EPOCH, EpochSpec, FEATURE_NAMES, FS, START_MS, extract
-from .quality import ChannelQuality, assess_signal_quality
-from .training import OnlineTrainer, TrialPlan, image_files
+from .config import CONFIG, AppConfig
+from .dataset import Dataset, StimulusImage, load_dataset
+from .features import EpochSpec, FeatureExtractor, START_MS
+from .quality import ChannelQuality, SignalQuality
+from .training import ROLLING, MultiTrainer, TrialPlan
+
+CURVE_COLORS = ("#6dd7bf", "#8bb9ff", "#ffb86b", "#ff727a", "#c79bff", "#f4e06d", "#7fe08a", "#ff9ed8")
 
 
 class Stimulus(QWidget):
@@ -86,7 +91,7 @@ class PresentationPanel(QWidget):
         self.note = QLabel()
         self.note.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(self.note)
-        self.set_timing(.6, 1.0, DEFAULT_EPOCH)
+        self.set_timing(.6, 1.0, EpochSpec())
 
     def set_timing(self, fixation_min: float, fixation_max: float, spec: EpochSpec):
         self.note.setText(f"Fixation: {fixation_min:g}–{fixation_max:g} s   ·   Image: {spec.image_duration_ms / 1000:g} s   ·   EEG epoch: {START_MS} to +{spec.end_ms} ms")
@@ -98,10 +103,11 @@ class TrainingPanel(QWidget):
     save_requested = Signal()
     discard_requested = Signal()
 
-    def __init__(self):
+    def __init__(self, config: AppConfig, min_image_s: float):
         super().__init__()
+        self.n_groups = len(config.datasets)
         layout = QVBoxLayout(self)
-        heading = QLabel("Scene valence training")
+        heading = QLabel("Scene emotion training")
         heading.setObjectName("heading")
         layout.addWidget(heading)
         form = QFormLayout()
@@ -112,19 +118,19 @@ class TrainingPanel(QWidget):
         self.serial.setPlaceholderText("Blank = first available Unicorn")
         form.addRow("Unicorn serial", self.serial)
         self.count = QSpinBox()
-        self.count.setRange(2, 100000)
-        self.count.setSingleStep(2)
-        self.count.setValue(160)
+        self.count.setRange(self.n_groups, 100000)
+        self.count.setSingleStep(self.n_groups)
+        self.count.setValue(max(self.n_groups, 160 - 160 % self.n_groups))
         form.addRow("Presentations", self.count)
         self.persistent = QCheckBox("Continue until manually stopped")
         self.persistent.toggled.connect(self.count.setDisabled)
         form.addRow("Mode", self.persistent)
         self.image_seconds = QDoubleSpinBox()
-        self.image_seconds.setRange(.7, 60.0)
+        self.image_seconds.setRange(min_image_s, 60.0)
         self.image_seconds.setDecimals(2)
         self.image_seconds.setSingleStep(.1)
         self.image_seconds.setSuffix(" s")
-        self.image_seconds.setValue(1.0)
+        self.image_seconds.setValue(max(1.0, min_image_s))
         form.addRow("Image duration", self.image_seconds)
         self.fixation_min = QDoubleSpinBox()
         self.fixation_min.setRange(.2, 60.0)
@@ -155,14 +161,32 @@ class TrainingPanel(QWidget):
         self.warmup_seconds.setValue(12)
         self.warmup_seconds.setSuffix(" s")
         form.addRow("Settling duration", self.warmup_seconds)
+        classifier_row = QHBoxLayout()
+        self.classifier_boxes: dict[str, QCheckBox] = {}
+        for key, spec in classifiers.CLASSIFIERS.items():
+            box = QCheckBox(spec.label)
+            box.setChecked(key in config.classifiers)
+            self.classifier_boxes[key] = box
+            classifier_row.addWidget(box)
+        classifier_row.addStretch()
+        form.addRow("Classifiers", classifier_row)
         layout.addLayout(form)
-        self.detail = QLabel("Finite runs are exactly balanced and shuffled; continuous runs draw each label independently at 50%. OSCAR adapts online; g.Pype does not expose a saved calibration state.")
+        self.dataset_status = QLabel()
+        self.dataset_status.setWordWrap(True)
+        layout.addWidget(self.dataset_status)
+        self.config_note = QLabel()
+        self.config_note.setWordWrap(True)
+        self.config_note.setObjectName("warning")
+        layout.addWidget(self.config_note)
+        self.detail = QLabel(f"Finite runs are exactly balanced across the {self.n_groups} dataset folders and shuffled; "
+                             "continuous runs draw a folder uniformly at random. Each target/classifier pair predicts a trial "
+                             "before that trial is added to its fit. OSCAR adapts online; g.Pype does not expose a saved calibration state.")
         self.detail.setWordWrap(True)
         layout.addWidget(self.detail)
         buttons = QHBoxLayout()
         self.start = QPushButton("Start training")
         self.stop = QPushButton("Stop training")
-        self.save = QPushButton("Save fitted model")
+        self.save = QPushButton("Save fitted models")
         self.discard = QPushButton("Discard run")
         self.stop.setEnabled(False)
         self.save.setEnabled(False)
@@ -184,60 +208,127 @@ class TrainingPanel(QWidget):
         self.device_status = QLabel("Checking for Unicorn…")
         self.device_status.setWordWrap(True)
         layout.addWidget(self.device_status)
-        self.count_status = QLabel("Trials: 0 · usable EEG: 0 · held-out predictions: 0")
+        self.count_status = QLabel("Trials: 0 · usable EEG: 0")
         layout.addWidget(self.count_status)
-        self.accuracy = QLabel("Last 20 held-out predictions: —")
-        self.accuracy.setObjectName("metric")
+        self.accuracy = QTableWidget(0, 4)
+        self.accuracy.setHorizontalHeaderLabels(("Target", "Classifier", f"Last {ROLLING} held-out correct", "Predictions"))
+        self.accuracy.horizontalHeader().setStretchLastSection(True)
+        self.accuracy.setColumnWidth(1, 220)
+        self.accuracy.setColumnWidth(2, 200)
+        self.accuracy.setMaximumHeight(170)
         layout.addWidget(self.accuracy)
         self.plot = pg.PlotWidget()
         self.plot.setBackground("#101827")
-        self.plot.setLabel("left", "Correct", units="%")
+        self.plot.setLabel("left", "Correct (rolling)", units="%")
         self.plot.setLabel("bottom", "Presented trial")
         self.plot.setYRange(0, 100)
         self.plot.showGrid(x=True, y=True, alpha=.2)
-        self.curve = self.plot.plot(pen=pg.mkPen("#6dd7bf", width=3), symbol="o", symbolSize=6)
+        self.plot.addLegend(offset=(-10, 10))
         layout.addWidget(self.plot, 1)
-        self.weights = QTableWidget(len(FEATURE_NAMES), 2)
-        self.weights.setHorizontalHeaderLabels(("Feature", "Standardized weight"))
+        self.weights = QTableWidget(0, 1)
         self.weights.horizontalHeader().setStretchLastSection(True)
-        self.weights.setColumnWidth(0, 370)
         self.weights.setMaximumHeight(195)
-        for row, name in enumerate(FEATURE_NAMES):
-            self.weights.setItem(row, 0, QTableWidgetItem(name))
-            self.weights.setItem(row, 1, QTableWidgetItem("—"))
         layout.addWidget(self.weights)
-        self.x: list[int] = []
-        self.y: list[float] = []
+        self.model_keys: list[tuple[str, str]] = []
+        self.curves: dict[tuple[str, str], tuple[object, list[int], list[float]]] = {}
 
-    def reset_plot(self):
-        self.x.clear(); self.y.clear(); self.curve.setData([], [])
+    def selected_classifiers(self) -> list[str]:
+        return [key for key, box in self.classifier_boxes.items() if box.isChecked()]
 
-    def add_accuracy(self, trial: int, value: float):
-        self.x.append(trial); self.y.append(value)
-        self.curve.setData(self.x, self.y)
+    def configure_models(self, model_keys: list[tuple[str, str]], feature_names: tuple[str, ...]):
+        """Reset the accuracy table, curves and weight table for a new run."""
+        self.model_keys = list(model_keys)
+        self.plot.clear()
+        if self.plot.plotItem.legend is not None:
+            self.plot.plotItem.legend.clear()
+        self.curves = {}
+        self.accuracy.setRowCount(len(model_keys))
+        for row, (target, clf) in enumerate(model_keys):
+            label = classifiers.CLASSIFIERS[clf].label
+            for col, text in enumerate((target, label, "—", "0")):
+                self.accuracy.setItem(row, col, QTableWidgetItem(text))
+            pen = pg.mkPen(CURVE_COLORS[row % len(CURVE_COLORS)], width=3)
+            curve = self.plot.plot(pen=pen, symbol="o", symbolSize=5, name=f"{target} · {label}")
+            self.curves[(target, clf)] = (curve, [], [])
+        self.weights.clear()
+        self.weights.setRowCount(len(feature_names))
+        self.weights.setColumnCount(1 + len(model_keys))
+        self.weights.setHorizontalHeaderLabels(("Feature", *[f"{t}/{c} weight" for t, c in model_keys]))
+        self.weights.setColumnWidth(0, 300)
+        for row, name in enumerate(feature_names):
+            self.weights.setItem(row, 0, QTableWidgetItem(name))
+            for col in range(len(model_keys)):
+                self.weights.setItem(row, col + 1, QTableWidgetItem("—"))
 
-    def update_weights(self, trainer: OnlineTrainer):
-        coefficients = trainer.model.steps[1][1].coef_[0] if trainer.model is not None else None
-        for row in range(len(FEATURE_NAMES)):
-            self.weights.item(row, 1).setText(f"{coefficients[row]:+.3f}" if coefficients is not None else "—")
+    def add_accuracy(self, key: tuple[str, str], trial: int, value: float):
+        curve, xs, ys = self.curves[key]
+        xs.append(trial)
+        ys.append(value)
+        curve.setData(xs, ys)
+
+    def update_models(self, trainer: MultiTrainer):
+        for row, key in enumerate(self.model_keys):
+            model = trainer.models[key]
+            accuracy = model.rolling_accuracy
+            self.accuracy.item(row, 2).setText(
+                "—" if accuracy is None else f"{accuracy:.1f}% (of {min(ROLLING, len(model.predictions))})")
+            self.accuracy.item(row, 3).setText(str(len(model.predictions)))
+            weights = classifiers.coefficients(model.model)
+            for feature in range(self.weights.rowCount()):
+                if model.model is None:
+                    text = "—"
+                else:
+                    text = "n/a (non-linear)" if weights is None else f"{weights[feature]:+.3f}"
+                self.weights.item(feature, row + 1).setText(text)
+
+
+# Approximate 10-20 positions on the 400x300 top-view drawing (nose up).
+ELECTRODE_XY = {
+    "FPZ": (200, 40), "FP1": (165, 42), "FP2": (235, 42),
+    "AFZ": (200, 55), "AF3": (170, 57), "AF4": (230, 57),
+    "F7": (118, 78), "F3": (155, 72), "F1": (178, 70), "FZ": (200, 69),
+    "F2": (222, 70), "F4": (245, 72), "F8": (282, 78),
+    "FC5": (118, 106), "FC3": (146, 104), "FC1": (172, 104), "FCZ": (200, 104),
+    "FC2": (228, 104), "FC4": (254, 104), "FC6": (282, 106),
+    "T7": (96, 139), "C5": (116, 139), "C3": (138, 139), "C1": (170, 140), "CZ": (200, 141),
+    "C2": (230, 140), "C4": (262, 139), "C6": (284, 139), "T8": (304, 139),
+    "CP5": (116, 172), "CP3": (145, 172), "CP1": (172, 172), "CPZ": (200, 172),
+    "CP2": (228, 172), "CP4": (255, 172), "CP6": (284, 172),
+    "P7": (118, 210), "P3": (150, 204), "P1": (176, 203), "PZ": (200, 202),
+    "P2": (224, 203), "P4": (250, 204), "P8": (282, 210),
+    "PO7": (125, 235), "PO3": (168, 232), "POZ": (200, 230), "PO4": (232, 232), "PO8": (275, 235),
+    "O1": (165, 258), "OZ": (200, 255), "O2": (235, 258),
+}
+
+
+def electrode_positions(channels: tuple[str, ...]) -> list[tuple[int, int]]:
+    """Known 10-20 names get their scalp position; unknown names line up at the bottom."""
+    unknown = [c for c in channels if c.upper() not in ELECTRODE_XY]
+    out = []
+    for name in channels:
+        if name.upper() in ELECTRODE_XY:
+            out.append(ELECTRODE_XY[name.upper()])
+        else:
+            i = unknown.index(name)
+            out.append((round(200 + (i - (len(unknown) - 1) / 2) * 50), 290))
+    return out
 
 
 class ElectrodeMap(QWidget):
-    """Top-view brain diagram with eight live channel-status lights."""
+    """Top-view brain diagram with one live status light per configured electrode."""
 
-    POSITIONS = ((200, 69), (138, 139), (200, 141), (262, 139),
-                 (200, 202), (125, 235), (200, 255), (275, 235))
-
-    def __init__(self):
+    def __init__(self, channels: tuple[str, ...]):
         super().__init__()
-        self.ratings = [ChannelQuality(None, "Waiting for EEG") for _ in CHANNELS]
+        self.channels = channels
+        self.POSITIONS = electrode_positions(channels)
+        self.ratings = [ChannelQuality(None, "Waiting for EEG") for _ in channels]
         self.setMinimumHeight(260)
         self.setMaximumHeight(310)
         self.setMouseTracking(True)
 
     def set_quality(self, ratings: list[ChannelQuality] | None):
         self.ratings = ratings if ratings is not None else [
-            ChannelQuality(None, "Waiting for EEG") for _ in CHANNELS]
+            ChannelQuality(None, "Waiting for EEG") for _ in self.channels]
         self.update()
 
     def _transform(self):
@@ -252,7 +343,7 @@ class ElectrodeMap(QWidget):
         painter.scale(scale, scale)
 
         # Scalp outline and nose establish orientation; the brain sits below
-        # the eight channel markers, which remain the most prominent elements.
+        # the channel markers, which remain the most prominent elements.
         painter.setPen(QPen(QColor("#8292aa"), 3))
         painter.setBrush(QColor("#142638"))
         painter.drawEllipse(QRectF(76, 23, 248, 258))
@@ -294,7 +385,7 @@ class ElectrodeMap(QWidget):
             painter.drawPath(fold)
 
         painter.setFont(QFont("Arial", 11, QFont.Weight.DemiBold))
-        for (x, y), name, rating in zip(self.POSITIONS, CHANNELS, self.ratings, strict=True):
+        for (x, y), name, rating in zip(self.POSITIONS, self.channels, self.ratings, strict=True):
             color = QColor({True: "#6dd7bf", False: "#ff727a", None: "#a3acbd"}[rating.good])
             halo = QColor(color)
             halo.setAlpha(105)
@@ -311,7 +402,7 @@ class ElectrodeMap(QWidget):
     def mouseMoveEvent(self, event):
         scale, dx, dy = self._transform()
         x, y = (event.position().x() - dx) / scale, (event.position().y() - dy) / scale
-        for (cx, cy), name, rating in zip(self.POSITIONS, CHANNELS, self.ratings, strict=True):
+        for (cx, cy), name, rating in zip(self.POSITIONS, self.channels, self.ratings, strict=True):
             if (x - cx) ** 2 + (y - cy) ** 2 <= 18 ** 2:
                 QToolTip.showText(event.globalPosition().toPoint(), f"{name}: {rating.detail}", self)
                 return
@@ -322,7 +413,7 @@ class ElectrodeMap(QWidget):
 
 
 class FeaturePanel(QWidget):
-    def __init__(self):
+    def __init__(self, feature_names: tuple[str, ...], channels: tuple[str, ...]):
         super().__init__()
         layout = QVBoxLayout(self)
         heading = QLabel("EEG features over time")
@@ -334,14 +425,14 @@ class FeaturePanel(QWidget):
         quality_title = QLabel("Electrode signal checks")
         quality_title.setObjectName("heading")
         layout.addWidget(quality_title)
-        self.quality_map = ElectrodeMap()
+        self.quality_map = ElectrodeMap(channels)
         layout.addWidget(self.quality_map)
         quality_note = QLabel("Top = forehead. Green = recent amplitude looks plausible; red = flat or unusually large; grey = waiting. Hover over an electrode for measurements. This checks the streamed signal (after OSCAR if enabled), not electrode impedance or guaranteed scalp contact. Allow 2 s after connecting.")
         quality_note.setWordWrap(True)
         layout.addWidget(quality_note)
         self.set_quality(None)
         self.selector = QComboBox()
-        self.selector.addItems(FEATURE_NAMES)
+        self.selector.addItems(feature_names)
         layout.addWidget(self.selector)
         self.current = QLabel("Current value: —")
         layout.addWidget(self.current)
@@ -388,25 +479,29 @@ class DetachedWindow(QMainWindow):
 @dataclass
 class PendingEpoch:
     number: int
-    label: str
-    path: Path
+    image: StimulusImage
     onset: float
     deadline: float
 
 
 class MainWindow(QMainWindow):
-    def __init__(self, root: Path):
+    def __init__(self, root: Path, config: dict | None = None):
         super().__init__()
         self.root = root
+        self.config = AppConfig.from_dict(CONFIG if config is None else config, root)
+        self.extractor = FeatureExtractor(self.config.eeg)
+        self.quality = SignalQuality(self.config.eeg)
+        self.idle_spec = self.extractor.epoch_spec(max(1000, self.extractor.min_image_duration_ms))
         self.setWindowTitle("Hot Brain · scene training")
-        self.resize(1120, 780)
-        self.training = TrainingPanel()
-        self.device = DeviceManager(self.training.serial.text().strip() or None)
+        self.resize(1120, 860)
+        self.training = TrainingPanel(self.config, self.extractor.min_image_duration_ms / 1000)
+        self.device = DeviceManager(self.config.eeg, self.training.serial.text().strip() or None)
         self.presentation = PresentationPanel()
-        self.epoch_spec = DEFAULT_EPOCH
+        self.epoch_spec = self.idle_spec
         for control in (self.training.image_seconds, self.training.fixation_min, self.training.fixation_max):
             control.valueChanged.connect(self.update_timing_note)
-        self.features = FeaturePanel()
+        self.update_timing_note()
+        self.features = FeaturePanel(self.extractor.names, self.extractor.channels)
         self.panels = [self.training, self.presentation, self.features]
         self.titles = ["Training progress", "Image presentation", "EEG features"]
         self.detached: dict[int, DetachedWindow] = {}
@@ -427,10 +522,14 @@ class MainWindow(QMainWindow):
         self.presentation.stimulus.onset.connect(self.on_image_onset)
         self.device.status_changed.connect(self.training.device_status.setText)
         self.device.connected_changed.connect(self.on_connection)
+        warnings = self.config.eeg.warnings()
+        self.training.config_note.setText("\n".join(f"Config warning: {w}" for w in warnings))
+        self.training.config_note.setVisible(bool(warnings))
+        self.dataset: Dataset | None = self.load_dataset(show_errors=False)
         self.plan: TrialPlan | None = None
-        self.trainer = OnlineTrainer()
+        self.trainer = MultiTrainer([], [], len(self.extractor.names))
         self.pending: list[PendingEpoch] = []
-        self.next_trial: tuple[str, Path] | None = None
+        self.next_trial: StimulusImage | None = None
         self.active = False
         self.finishing = False
         self.shown = 0
@@ -442,15 +541,35 @@ class MainWindow(QMainWindow):
         self.trial_log: list[dict] = []
         self.epochs: list[np.ndarray] = []
         self.epoch_trial_numbers: list[int] = []
+        self.epoch_labels: list[dict[str, int]] = []
+        self.epoch_values: list[dict[str, float]] = []
+        self.epoch_groups: list[str] = []
         self.run_start_clock = 0.0
         self.clock = QTimer(self)
         self.clock.setInterval(100)
         self.clock.timeout.connect(self.poll)
         self.clock.start()
-        self.setStyleSheet("QMainWindow,QWidget{background:#182335;color:#e8effc;font-size:13px} QLabel#heading{font-size:24px;font-weight:700;margin:4px 0 10px} QLabel#metric{font-size:18px;font-weight:600;color:#6dd7bf} QLabel#status{font-size:16px;font-weight:600} QPushButton{background:#29466c;border-radius:7px;padding:8px 12px} QPushButton:hover{background:#376293} QPushButton:disabled{background:#354155;color:#8d9aaf} QSpinBox,QDoubleSpinBox,QComboBox{background:#25364e;padding:5px;border:1px solid #627795} QTabBar::tab{padding:9px 17px}")
+        self.setStyleSheet("QMainWindow,QWidget{background:#182335;color:#e8effc;font-size:13px} QLabel#heading{font-size:24px;font-weight:700;margin:4px 0 10px} QLabel#metric{font-size:18px;font-weight:600;color:#6dd7bf} QLabel#warning{color:#ffb86b} QLabel#status{font-size:16px;font-weight:600} QPushButton{background:#29466c;border-radius:7px;padding:8px 12px} QPushButton:hover{background:#376293} QPushButton:disabled{background:#354155;color:#8d9aaf} QSpinBox,QDoubleSpinBox,QComboBox{background:#25364e;padding:5px;border:1px solid #627795} QTabBar::tab{padding:9px 17px}")
+
+    @property
+    def _settings_widgets(self) -> list[QWidget]:
+        t = self.training
+        return [t.participant, t.serial, t.count, t.persistent, t.stop_key, t.oscar, t.warmup, t.warmup_seconds,
+                t.image_seconds, t.fixation_min, t.fixation_max, *t.classifier_boxes.values()]
+
+    def load_dataset(self, show_errors: bool = True) -> Dataset | None:
+        try:
+            dataset = load_dataset(self.config)
+        except (OSError, ValueError) as exc:
+            self.training.dataset_status.setText(f"Dataset error: {exc}")
+            if show_errors:
+                QMessageBox.warning(self, "Dataset", str(exc))
+            return None
+        self.training.dataset_status.setText(f"Dataset ({self.config.data_dir.name}/): {dataset.summary()}")
+        return dataset
 
     def update_timing_note(self):
-        spec = EpochSpec(round(self.training.image_seconds.value() * 1000))
+        spec = self.extractor.epoch_spec(round(self.training.image_seconds.value() * 1000))
         self.presentation.set_timing(self.training.fixation_min.value(), self.training.fixation_max.value(), spec)
 
     def _insert_tab(self, index: int, panel: QWidget):
@@ -485,7 +604,10 @@ class MainWindow(QMainWindow):
             self.tabs.setCurrentWidget(panel.parentWidget())
 
     def on_connection(self, connected: bool):
-        self.features.note.setText("Live Unicorn EEG · 250 Hz · OSCAR " + ("on" if self.device.oscar else "off") if connected else "Waiting for Unicorn; continuing image loop without EEG.")
+        eeg = self.config.eeg
+        self.features.note.setText(
+            f"Live Unicorn EEG · {eeg.fs} Hz · {', '.join(eeg.electrodes)} · OSCAR " + ("on" if self.device.oscar else "off")
+            if connected else "Waiting for Unicorn; continuing image loop without EEG.")
         if not connected:
             self.features.set_quality(None)
 
@@ -495,46 +617,55 @@ class MainWindow(QMainWindow):
         if fixation_min > fixation_max:
             QMessageBox.warning(self, "Fixation timing", "Fixation minimum must be at most the maximum.")
             return
-        self.epoch_spec = EpochSpec(round(self.training.image_seconds.value() * 1000))
-        self.device.set_retention(self.training.image_seconds.value() + 5)
-        images = image_files(self.root)
-        for paths in images.values():
-            for path in paths:
-                if not QImageReader(str(path)).canRead():
-                    QMessageBox.warning(self, "Image error", f"Cannot read {path}")
-                    return
-        total = None if self.training.persistent.isChecked() else self.training.count.value()
-        if total is not None and total % 2:
-            QMessageBox.warning(self, "Balanced trials", "Choose an even presentation count.")
+        classifier_keys = self.training.selected_classifiers()
+        if not classifier_keys:
+            QMessageBox.warning(self, "Classifiers", "Select at least one classifier.")
             return
         try:
-            self.plan = TrialPlan(images, total)
+            self.epoch_spec = self.extractor.epoch_spec(round(self.training.image_seconds.value() * 1000))
+        except ValueError as exc:
+            QMessageBox.warning(self, "Image duration", str(exc)); return
+        self.dataset = self.load_dataset()
+        if self.dataset is None:
+            return
+        for items in self.dataset.groups.values():
+            for item in items:
+                if not QImageReader(str(item.path)).canRead():
+                    QMessageBox.warning(self, "Image error", f"Cannot read {item.path}")
+                    return
+        total = None if self.training.persistent.isChecked() else self.training.count.value()
+        try:
+            self.plan = TrialPlan(self.dataset.groups, total)
         except ValueError as exc:
             QMessageBox.warning(self, "Training images", str(exc)); return
-        self.trainer = OnlineTrainer()
+        self.device.set_retention(self.training.image_seconds.value() + 5)
+        target_names = [t.name for t in self.config.targets]
+        self.trainer = MultiTrainer(target_names, classifier_keys, len(self.extractor.names))
+        self.training.configure_models(list(self.trainer.models), self.extractor.names)
         self.pending.clear()
         self.shown = self.usable = self.skipped = 0
-        self.training.reset_plot()
-        self.training.update_weights(self.trainer)
-        self.training.accuracy.setText("Last 20 held-out predictions: —")
         self.training.start.setEnabled(False)
         self.training.stop.setEnabled(True)
         self.stop_shortcut.setEnabled(True)
         self.training.save.setEnabled(False)
         self.training.discard.setEnabled(False)
-        for widget in (self.training.participant, self.training.serial, self.training.count, self.training.persistent, self.training.stop_key, self.training.oscar,
-                       self.training.warmup, self.training.warmup_seconds, self.training.image_seconds, self.training.fixation_min, self.training.fixation_max):
+        for widget in self._settings_widgets:
             widget.setEnabled(False)
         self.active = True
         self.finishing = False
         self.trial_log = []
         self.epochs = []
         self.epoch_trial_numbers = []
+        self.epoch_labels = []
+        self.epoch_values = []
+        self.epoch_groups = []
         self.run_start_clock = time.perf_counter()
+        self._update_counts()
         # A hidden tab does not paint, so give the participant a visible window.
         if 1 not in self.detached:
             self.detach(1)
         self.detached[1].raise_()
+        eeg = self.config.eeg
         self.run_metadata = {"started_at": datetime.now().astimezone().isoformat(),
                              "participant_id": self.training.participant.text().strip() or "unnamed",
                              "unicorn_serial": self.training.serial.text().strip() or None,
@@ -544,10 +675,13 @@ class MainWindow(QMainWindow):
                              "fixation_min_s": fixation_min, "fixation_max_s": fixation_max,
                              "epoch_start_ms": START_MS, "epoch_end_ms": self.epoch_spec.end_ms,
                              "epoch_sample_count": self.epoch_spec.n_samples,
+                             "fs": eeg.fs, "channels": eeg.electrodes, "device_channels": eeg.device_channels,
+                             "feature_names": self.extractor.names, "classifiers": classifier_keys,
+                             "config": self.config.raw,
                              "oscar_settling_requested_seconds": self.training.warmup_seconds.value() if self.training.warmup.isChecked() else 0,
                              "oscar_settling_applied_seconds": 0,
-                             "dataset": {k: [p.name for p in v] for k, v in images.items()},
-                             "timing_note": "Image onset uses Qt paint completion; EEG times anchor to first host frame arrival minus device/OSCAR delay then advance at 250 Hz. Validate with hardware trigger."}
+                             "dataset": self.dataset.manifest(),
+                             "timing_note": f"Image onset uses Qt paint completion; EEG times anchor to first host frame arrival minus device/OSCAR delay then advance at {eeg.fs} Hz. Validate with hardware trigger."}
         self.device.configure(self.training.oscar.isChecked(), self.training.serial.text().strip() or None)
         if self.training.oscar.isChecked() and self.training.warmup.isChecked() and self.device.connected:
             seconds = self.training.warmup_seconds.value()
@@ -574,21 +708,21 @@ class MainWindow(QMainWindow):
     def show_trial(self):
         if not self.active or self.next_trial is None:
             return
-        label, path = self.next_trial
-        self.presentation.stimulus.image(path)
+        self.presentation.stimulus.image(self.next_trial.path)
         # The paint callback is the closest software-side onset observation.
 
     def on_image_onset(self, stamp: float):
         if not self.active or self.next_trial is None:
             return
-        label, path = self.next_trial
+        item = self.next_trial
         self.shown += 1
-        self.pending.append(PendingEpoch(self.shown, label, path, stamp,
-                                         stamp + self.epoch_spec.end_ms / 1000 + 2.0))
-        self.trial_log.append({"number": self.shown, "label": label, "image": path.name,
+        self.pending.append(PendingEpoch(self.shown, item, stamp, stamp + self.epoch_spec.end_ms / 1000 + 2.0))
+        self.trial_log.append({"number": self.shown, "group": item.group, "image": item.path.name,
+                               "labels": {t: self.dataset.class_name(t, v) for t, v in item.labels.items()},
+                               "target_values": dict(item.values),
                                "onset_s_from_run_start": round(stamp - self.run_start_clock, 6),
                                "eeg": "pending"})
-        self.training.status.setText(f"Image {self.shown}: {path.name}")
+        self.training.status.setText(f"Image {self.shown}: {item.group}/{item.path.name}")
         self._update_counts()
         self.next_trial = None
         QTimer.singleShot(self.epoch_spec.image_duration_ms, self.end_image)
@@ -605,44 +739,48 @@ class MainWindow(QMainWindow):
             self.last_quality_time = now
             if self.device.connected and now - self.device.ring.latest < 1.0:
                 _, quality_samples = self.device.ring.recent(3)
-                self.features.set_quality(assess_signal_quality(quality_samples))
+                self.features.set_quality(self.quality.assess(quality_samples))
             else:
                 self.features.set_quality(None)
         if self.device.connected and now - self.last_feature_time >= .25:
-            spec = self.epoch_spec if self.active or self.finishing else DEFAULT_EPOCH
-            times, samples = self.device.ring.recent(max(2, spec.n_samples / FS + 1))
+            spec = self.epoch_spec if self.active or self.finishing else self.idle_spec
+            times, samples = self.device.ring.recent(max(2, spec.n_samples / spec.fs + 1))
             if len(samples) >= spec.n_samples and times[-1] > self.last_feature_time:
                 try:
-                    values = extract(samples[-spec.n_samples:], spec)
+                    values = self.extractor.extract(samples[-spec.n_samples:], spec)
                     self.features.add(times[-1], values)
                     self.last_feature_time = now
                 except ValueError:
                     pass
         for item in self.pending[:]:
-            if self.device.connected:
-                epoch = self.device.ring.epoch(item.onset, self.epoch_spec)
-            else:
-                epoch = None
+            epoch = self.device.ring.epoch(item.onset, self.epoch_spec) if self.device.connected else None
             if epoch is not None:
+                log = self.trial_log[item.number - 1]
                 try:
-                    vector = extract(epoch, self.epoch_spec)
+                    vector = self.extractor.extract(epoch, self.epoch_spec)
                     # Guard gross artifacts/flatlines without pretending OSCAR has fixed them.
                     if np.ptp(epoch, axis=0).max() > 500 or np.ptp(epoch, axis=0).min() < .05:
                         raise ValueError("artifact or flat channel")
-                    prediction = self.trainer.add(vector, item.label)
+                except ValueError:
+                    self.skipped += 1
+                    log["eeg"] = "rejected_artifact"
+                else:
+                    predictions = self.trainer.add(vector, item.image.labels)
                     self.usable += 1
                     self.epochs.append(epoch.astype(np.float32))
                     self.epoch_trial_numbers.append(item.number)
-                    self.trial_log[item.number - 1]["eeg"] = "usable"
-                    self.training.update_weights(self.trainer)
-                    if prediction is not None:
-                        self.trial_log[item.number - 1].update({"prediction": prediction.label,
-                            "p_happy": prediction.probability_happy, "correct": prediction.correct})
-                        self.training.add_accuracy(item.number, self.trainer.rolling_accuracy)
-                        self.training.accuracy.setText(f"Last {min(20, len(self.trainer.predictions))} held-out predictions: {self.trainer.rolling_accuracy:.1f}%")
-                except ValueError:
-                    self.skipped += 1
-                    self.trial_log[item.number - 1]["eeg"] = "rejected_artifact"
+                    self.epoch_labels.append(dict(item.image.labels))
+                    self.epoch_values.append(dict(item.image.values))
+                    self.epoch_groups.append(item.image.group)
+                    log["eeg"] = "usable"
+                    if predictions:
+                        log["predictions"] = {
+                            f"{t}/{c}": {"predicted": self.dataset.class_name(t, p.label),
+                                         "p_class1": p.probability, "correct": p.correct}
+                            for (t, c), p in predictions.items()}
+                        for key in predictions:
+                            self.training.add_accuracy(key, item.number, self.trainer.models[key].rolling_accuracy)
+                    self.training.update_models(self.trainer)
                 self.pending.remove(item)
                 self._update_counts()
             elif now >= item.deadline:
@@ -657,7 +795,7 @@ class MainWindow(QMainWindow):
             self.finish_run()
 
     def _update_counts(self):
-        self.training.count_status.setText(f"Trials: {self.shown} · usable EEG: {self.usable} · held-out predictions: {len(self.trainer.predictions)} · skipped: {self.skipped}")
+        self.training.count_status.setText(f"Trials: {self.shown} · usable EEG: {self.usable} · skipped: {self.skipped}")
 
     def stop_run(self):
         if not self.active:
@@ -674,38 +812,46 @@ class MainWindow(QMainWindow):
     def finish_run(self):
         self.finishing = False
         self.training.status.setText(f"Stopped after {self.shown} presentations; {self.usable} usable EEG trials.")
-        self.training.save.setEnabled(self.trainer.model is not None)
+        self.training.save.setEnabled(self.trainer.any_fitted)
         self.training.discard.setEnabled(True)
         self.run_metadata.update({"stopped_at": datetime.now().astimezone().isoformat(),
                                   "presented_trials": self.shown, "skipped_eeg_trials": self.skipped,
                                   "trial_log": self.trial_log})
-        if self.trainer.model is None:
+        if not self.trainer.any_fitted:
             self.training.status.setText(self.training.status.text() + " A model needs at least 10 usable EEG trials with both labels.")
 
     def save_model(self):
         directory = self.root / "saved_models"
         directory.mkdir(exist_ok=True)
         participant = "".join(c if c.isalnum() or c in "_-" else "_" for c in self.run_metadata["participant_id"])
-        stem = directory / (f"scene_valence_{participant}_" + datetime.now().strftime("%Y%m%d_%H%M%S_%f"))
+        stem = directory / (f"scene_{participant}_" + datetime.now().strftime("%Y%m%d_%H%M%S_%f"))
         epochs_path = stem.with_suffix(".epochs.npz")
         self.run_metadata["epochs_file"] = epochs_path.name
         try:
-            weights, metadata = self.trainer.save(stem, self.run_metadata)
+            written = self.trainer.save(stem, self.run_metadata)
         except ValueError as exc:
             QMessageBox.warning(self, "Cannot save", str(exc)); return
+        labels = {f"label_{t}": np.asarray([row[t] for row in self.epoch_labels], dtype=np.uint8)
+                  for t in self.trainer.targets}
+        labels.update({f"value_{t}": np.asarray([row[t] for row in self.epoch_values], dtype=np.float32)
+                       for t in self.trainer.targets})
         np.savez_compressed(epochs_path, eeg_uV=np.stack(self.epochs),
-                            label_happy=np.asarray(self.trainer.y, dtype=np.uint8),
-                            trial_number=np.asarray(self.epoch_trial_numbers, dtype=np.int32))
-        self.training.status.setText(f"Saved {weights.name}, {metadata.name}, and {epochs_path.name}")
+                            trial_number=np.asarray(self.epoch_trial_numbers, dtype=np.int32),
+                            group=np.asarray(self.epoch_groups, dtype=str),
+                            channels=np.asarray(self.config.eeg.electrodes, dtype=str), **labels)
+        self.training.status.setText(f"Saved {len(written) + 1} files to saved_models/{stem.name}.*")
         self.training.save.setEnabled(False)
         self.training.start.setEnabled(True)
         self.training.discard.setEnabled(False)
         self._enable_settings()
 
     def discard_run(self):
-        self.trainer = OnlineTrainer()
+        self.trainer = MultiTrainer([], [], len(self.extractor.names))
         self.epochs = []
         self.epoch_trial_numbers = []
+        self.epoch_labels = []
+        self.epoch_values = []
+        self.epoch_groups = []
         self.training.status.setText("Run discarded. Ready to start again.")
         self.training.start.setEnabled(True)
         self.training.save.setEnabled(False)
@@ -713,8 +859,7 @@ class MainWindow(QMainWindow):
         self._enable_settings()
 
     def _enable_settings(self):
-        for widget in (self.training.participant, self.training.serial, self.training.count, self.training.persistent, self.training.stop_key, self.training.oscar,
-                       self.training.warmup, self.training.warmup_seconds, self.training.image_seconds, self.training.fixation_min, self.training.fixation_max):
+        for widget in self._settings_widgets:
             widget.setEnabled(True)
         self.training.count.setEnabled(not self.training.persistent.isChecked())
 
@@ -727,9 +872,10 @@ class MainWindow(QMainWindow):
         event.accept()
 
 
-def launch(root: Path):
+def launch(root: Path, config: dict | None = None):
+    """Start the GUI. ``config`` defaults to ``hotbrain.config.CONFIG``."""
     app = QApplication.instance() or QApplication([])
     pg.setConfigOptions(antialias=True)
-    window = MainWindow(root)
+    window = MainWindow(root, config)
     window.show()
     return app.exec()
