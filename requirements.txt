@@ -3,4 +3,5 @@ numpy>=2.0
 scipy>=1.14
 scikit-learn>=1.5
 pyqtgraph>=0.13
+Pillow>=10
 gpype>=4.2.0

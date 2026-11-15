@@ -1,6 +1,43 @@
 # Hot Brain scene training prototype
 
-Participant-specific EEG decoding of emotional valence and arousal with the g.tec Unicorn headset.
+Participant-specific EEG experiments with the g.tec Unicorn headset.
+
+## Automatic face EEG pilot (default launch)
+
+Run `.venv/bin/python run.py` or use the desktop launcher. The app opens three
+windows: progress, participant faces, and live EEG/feature/quality diagnostics.
+It connects to Unicorn `UN-2019.03.01` with OSCAR off by default (wet-electrode
+pilot). Once real EEG streams and at least two of PO7/Oz/PO8 pass the provisional
+signal checks, the pilot starts after a five-second countdown. No training can
+start on simulated data. Press **Escape** anywhere to stop; the run also stops
+after 15 minutes at most. The three windows can be moved or maximised.
+
+The pilot uses *generated schematic faces* with fixed identity, background,
+lighting and position within each 20-second block. The neutral face appears
+at 6 Hz, with a happy or sad morph every fifth face (1.2 Hz). One neutral-only
+control block, four baseline blocks, ten adaptive training blocks and four
+final blocks are planned. Each expression block is followed by a slower
+five-face question: press **0** if none changed or **1–5** for the changed
+position, then **H/S** for happy/sad and **1–5** for perceived strength. The
+question times out if no key is pressed. The EEG metric is the predeclared
+1.2–4.8 Hz harmonic response on PO7, Oz and PO8, divided by nearby spectral
+noise. A training level becomes subtler only when that metric clears the
+provisional threshold and the question is answered correctly. The threshold
+and these faces have not been clinically validated.
+
+Raw real EEG, scan-validity flags, block markers, face timing, questions and
+answers are saved automatically in `recordings/face_pilot_*`. `output/` holds
+reproducibly rendered face PNGs. These folders are excluded from Git. The
+progress chart shows the EEG response per block. Live diagnostic plots are
+separate from the face response analysis.
+
+**Interpretation:** a tagged EEG response shows sensitivity to a repeated
+visual change; it does not prove that the participant understood an emotion.
+The schematic faces are an acquisition/interaction pilot, not validated social
+stimuli. Qt paint timing is logged and blocks with missing or irregular paints
+are rejected. Verify actual light-onset timing with a photodiode, especially
+through the VR display, before treating the EEG measure as research-grade.
+For the previous scene-training app, launch `run.py --scenes`.
 
 ## Project goals
 
