@@ -24,6 +24,8 @@ class StimulusImage:
     # (exclude_middle: too close to the class boundary).
     labels: dict[str, int | None] = field(hash=False, compare=False)
     values: dict[str, float] = field(default_factory=dict, hash=False, compare=False)
+    # Stimulus condition (config "conditions"), e.g. "negative"; None without conditions.
+    condition: str | None = field(default=None, hash=False, compare=False)
 
 
 @dataclass
@@ -39,6 +41,8 @@ class Dataset:
     margins: dict[str, float] = field(default_factory=dict)
     # Which images the thresholds/margins were computed from ("all images" or "training split").
     threshold_source: str = "all images"
+    # Images left out because they match no stimulus condition (not clear-cut).
+    not_in_any_condition: int = 0
 
     @property
     def images(self) -> list[StimulusImage]:
@@ -62,10 +66,17 @@ class Dataset:
         for t in self.targets:
             labelled = [i.labels[t.name] for i in images if i.labels[t.name] is not None]
             ones = sum(labelled)
-            rule = t.formula if self.thresholds[t.name] is None else f"{t.formula} > {self.thresholds[t.name]:.3g}"
+            if t.condition_labels:
+                rule = "condition: " + ", ".join(f"{c}={l}" for c, l in t.condition_labels)
+                why = "condition not used"
+            else:
+                rule = t.formula if self.thresholds[t.name] is None else f"{t.formula} > {self.thresholds[t.name]:.3g}"
+                why = f"middle {t.exclude_middle:.0%}"
             excluded = len(images) - len(labelled)
             parts.append(f"{t.name} ({rule}): {t.classes[0]} {len(labelled) - ones} / {t.classes[1]} {ones}"
-                         + (f" / {excluded} excluded (middle {t.exclude_middle:.0%})" if excluded else ""))
+                         + (f" / {excluded} excluded ({why})" if excluded else ""))
+        if self.not_in_any_condition:
+            parts.append(f"{self.not_in_any_condition} image(s) match no stimulus condition and are not shown")
         if self.rows_without_image:
             parts.append(f"{len(self.rows_without_image)} CSV row(s) without an image file skipped "
                          f"(e.g. {', '.join(self.rows_without_image[:3])})")
@@ -73,6 +84,7 @@ class Dataset:
 
     def manifest(self) -> dict:
         return {"groups": {g: [i.path.name for i in v] for g, v in self.groups.items()},
+                "not_in_any_condition": self.not_in_any_condition,
                 "targets": {t.name: {"value": t.formula, "columns": dict(t.columns),
                                      "threshold": self.thresholds[t.name], "scale": self.scales.get(t.name),
                                      "exclusion_margin": self.margins.get(t.name),
@@ -119,8 +131,24 @@ def load_dataset(config: AppConfig, folders: tuple[str, ...] | list[str] | None 
         for p in paths:
             rows[p] = (folder_name, metadata[p.name])
 
+    conditions: dict[Path, str | None] = {p: None for p in rows}
+    not_in_any_condition = 0
+    if config.conditions:
+        for p, (_, row) in list(rows.items()):
+            conditions[p] = _condition(config, row)
+            if conditions[p] is None:
+                del rows[p], conditions[p]
+                not_in_any_condition += 1
+        groups = {g: [p for p in paths if p in rows] for g, paths in groups.items()}
+        if not rows:
+            raise ValueError("No image matches any stimulus condition in CONFIG['conditions']")
+
     scores: dict[Path, dict[str, float]] = {p: {} for p in rows}
     for target in config.targets:
+        if not target.columns:     # defined by conditions only: the value is the label
+            for p in rows:
+                scores[p][target.name] = float(target.condition_label(conditions[p]))
+            continue
         for p, (_, row) in rows.items():
             try:
                 scores[p][target.name] = target.value(row)
@@ -132,15 +160,27 @@ def load_dataset(config: AppConfig, folders: tuple[str, ...] | list[str] | None 
         thresholds, margins, scales = dict(reference.thresholds), dict(reference.margins), dict(reference.scales)
     else:
         thresholds, margins, scales = _fit_thresholds(config.targets, list(scores.values()))
-    labels = {p: _labels(config.targets, scores[p], thresholds, margins) for p in rows}
+    labels = {p: _labels(config.targets, scores[p], thresholds, margins, conditions[p]) for p in rows}
     if reference is None:
         for target in config.targets:
             if len({labels[p][target.name] for p in rows} - {None}) < 2:
                 raise ValueError(f"Target {target.name!r}: every image has the same label from {target.formula}, "
                                  "so it cannot be classified. Pick another column or threshold.")
-    images = [StimulusImage(p, group, labels[p], scores[p]) for group, paths in groups.items() for p in paths]
+    images = [StimulusImage(p, group, labels[p], scores[p], conditions[p])
+              for group, paths in groups.items() for p in paths]
     return Dataset(_group(config, images, groups), config.targets, thresholds, scales, rows_without_image, margins,
-                   reference.threshold_source if reference is not None else "all images")
+                   reference.threshold_source if reference is not None else "all images", not_in_any_condition)
+
+
+def _condition(config: AppConfig, row: dict[str, str]) -> str | None:
+    """Name of the first stimulus condition the CSV row satisfies, or None."""
+    for condition in config.conditions:
+        try:
+            if condition.matches(row):
+                return condition.name
+        except KeyError as exc:
+            raise ValueError(f"Stimulus condition {condition.name!r}: column {exc} missing from a metadata CSV") from None
+    return None
 
 
 def _fit_thresholds(targets, values: list[dict[str, float]]):
@@ -162,11 +202,14 @@ def _fit_thresholds(targets, values: list[dict[str, float]]):
     return thresholds, margins, scales
 
 
-def _labels(targets, values: dict[str, float], thresholds, margins) -> dict[str, int | None]:
+def _labels(targets, values: dict[str, float], thresholds, margins,
+            condition: str | None = None) -> dict[str, int | None]:
     out: dict[str, int | None] = {}
     for target in targets:
         v, threshold = values[target.name], thresholds[target.name]
-        if threshold is None:
+        if target.condition_labels:
+            out[target.name] = target.condition_label(condition)
+        elif threshold is None:
             if v not in (0, 1):
                 raise ValueError(f"Target {target.name!r}: {target.formula} is not 0/1; set a threshold")
             out[target.name] = int(v)
@@ -182,13 +225,19 @@ def _group(config: AppConfig, images: list[StimulusImage], folders: dict[str, li
     if not config.balance_by:
         by_path = {i.path: i for i in images}
         return {g: [by_path[p] for p in paths] for g, paths in folders.items()}
+    if config.balance_by == "conditions":
+        by_condition: dict[str, list[StimulusImage]] = {c.name: [] for c in config.conditions}
+        for image in images:
+            by_condition[image.condition].append(
+                StimulusImage(image.path, image.condition, image.labels, image.values, image.condition))
+        return {g: sorted(v, key=lambda i: i.path) for g, v in by_condition.items() if v}
     target = next(t for t in config.targets if t.name == config.balance_by)
     regrouped: dict[str, list[StimulusImage]] = {}
     for image in images:
         label = image.labels[target.name]
         name = f"{target.name}={'excluded' if label is None else target.classes[label]}"
         regrouped.setdefault(name, []).append(
-            StimulusImage(image.path, name, image.labels, image.values))
+            StimulusImage(image.path, name, image.labels, image.values, image.condition))
     return {g: sorted(v, key=lambda i: i.path) for g, v in sorted(regrouped.items())}
 
 
@@ -199,11 +248,12 @@ def rethreshold(config: AppConfig, dataset: Dataset, reference_images: list[Stim
     thresholds (e.g. valence > 0) are unaffected.
     """
     thresholds, margins, scales = _fit_thresholds(config.targets, [i.values for i in reference_images])
-    images = [StimulusImage(i.path, i.group, _labels(config.targets, i.values, thresholds, margins), i.values)
+    images = [StimulusImage(i.path, i.group, _labels(config.targets, i.values, thresholds, margins, i.condition),
+                            i.values, i.condition)
               for items in dataset.groups.values() for i in items]
     folders: dict[str, list[Path]] = {}
     for items in dataset.groups.values():
         for i in items:
             folders.setdefault(i.group, []).append(i.path)
     return Dataset(_group(config, images, folders), dataset.targets, thresholds, scales,
-                   dataset.rows_without_image, margins, "training split")
+                   dataset.rows_without_image, margins, "training split", dataset.not_in_any_condition)

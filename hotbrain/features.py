@@ -12,7 +12,7 @@ applies the shared re-referencing and artifact rejection.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import numpy as np
 from scipy.signal import butter, iirnotch, sosfiltfilt, tf2sos, welch
@@ -289,9 +289,12 @@ class ArtifactError(ValueError):
 class TargetFeatures:
     """One feature extractor per target, built from a configuration profile.
 
-    ``positions`` are the GUI-selected model electrodes (indices into the
-    configured montage); each target uses the intersection with its profile
-    electrodes. Epochs passed to :meth:`extract` hold all configured channels.
+    ``positions`` optionally restrict every target to a subset of the
+    configured montage (indices); each target uses the intersection with its
+    own electrodes. Each target may also have its own analysis window: the
+    epoch spans the longest one and shorter targets use its leading part (same
+    onset and baseline). Epochs passed to :meth:`extract` hold all configured
+    channels.
     """
 
     def __init__(self, eeg: EEGSettings, profile: Profile, positions: tuple[int, ...] | None = None):
@@ -301,16 +304,24 @@ class TargetFeatures:
         allowed = {eeg.electrodes[i] for i in positions}
         self.extractors: dict[str, FeatureExtractor] = {}
         self.channel_indices: dict[str, tuple[int, ...]] = {}
+        self.windows: dict[str, int | None] = {}
         self.problems: dict[str, str] = {}
         for target, spec in profile.targets:
-            wanted = set(spec.electrodes or eeg.electrodes)
+            wanted = set(eeg.electrodes if spec.electrodes is None else spec.electrodes)
             names = tuple(n for n in eeg.electrodes if n in wanted and n in allowed)
             try:
                 sub = eeg.for_target(names, spec.bands, spec.features)
+                if spec.bandpass_hz is not None:   # feature filter only; artifact rejection keeps eeg's
+                    sub = replace(sub, bandpass_hz=spec.bandpass_hz)
+                extractor = FeatureExtractor(sub)
+                if spec.window_ms is not None and spec.window_ms < extractor.min_image_duration_ms - END_BEFORE_OFFSET_MS:
+                    raise ValueError(f"window {spec.window_ms} ms is shorter than the "
+                                     f"{extractor.min_image_duration_ms - END_BEFORE_OFFSET_MS} ms its ERP windows need")
             except ValueError as exc:
                 self.problems[target] = str(exc)
                 continue
-            self.extractors[target] = FeatureExtractor(sub)
+            self.extractors[target] = extractor
+            self.windows[target] = spec.window_ms
             self.channel_indices[target] = tuple(eeg.electrodes.index(n) for n in sub.electrodes)
         self.union_channels = tuple(sorted({i for idx in self.channel_indices.values() for i in idx}))
         self.sos = make_filter(eeg)
@@ -328,21 +339,39 @@ class TargetFeatures:
 
     def describe(self) -> dict:
         return {t: {"electrodes": list(e.eeg.electrodes), "bands": [b for b, _ in e.eeg.bands_hz],
-                    "features": list(e.eeg.features), "n_features": len(e.names)}
+                    "features": list(e.eeg.features), "n_features": len(e.names),
+                    "window_ms": self.windows[t], "bandpass_hz": list(e.eeg.bandpass_hz)}
                 for t, e in self.extractors.items()}
 
     @property
-    def min_image_duration_ms(self) -> int:
-        if self.profile.window_ms is not None:
+    def epoch_window_ms(self) -> int | None:
+        """Analysis window of the shared epoch: the longest target window (None = until image end)."""
+        windows = list(self.windows.values())
+        if not windows:
             return self.profile.window_ms
-        return max((e.min_image_duration_ms for e in self.extractors.values()), default=700)
+        return None if any(w is None for w in windows) else max(windows)
+
+    @property
+    def min_image_duration_ms(self) -> int:
+        need = [w if w is not None else e.min_image_duration_ms
+                for e, w in ((self.extractors[t], self.windows[t]) for t in self.extractors)]
+        return max(need, default=700)
 
     def epoch_spec(self, image_duration_ms: int) -> EpochSpec:
         if image_duration_ms < self.min_image_duration_ms:
             raise ValueError(f"Image duration must be at least {self.min_image_duration_ms / 1000:g} s "
-                             f"for configuration {self.profile.number}.")
-        return EpochSpec(image_duration_ms, self.eeg.fs, self.profile.window_ms,
+                             "for the selected analysis windows.")
+        return EpochSpec(image_duration_ms, self.eeg.fs, self.epoch_window_ms,
                          self.profile.baseline_ms[0], self.profile.baseline_ms[1])
+
+    def target_spec(self, target: str, spec: EpochSpec) -> EpochSpec:
+        """The part of an image epoch that ``target`` analyses (its own window, same onset and baseline).
+
+        Sustained-state windows (no baseline) are used whole by every target.
+        """
+        if spec.baseline_end_ms is None or self.windows.get(target) == spec.window_ms:
+            return spec
+        return replace(spec, window_ms=self.windows[target])
 
     def state_spec(self, window_s: float) -> EpochSpec:
         """Sliding-window layout for sustained states (calibration/test): whole window de-meaned."""
@@ -372,4 +401,8 @@ class TargetFeatures:
         """Feature vector per target from one epoch of all configured channels."""
         data = self.reference(epoch)
         self.check_artifacts(data, spec)
-        return {t: e.extract(data[:, self.channel_indices[t]], spec) for t, e in self.extractors.items()}
+        out = {}
+        for t, e in self.extractors.items():
+            own = self.target_spec(t, spec)
+            out[t] = e.extract(data[:own.n_samples, self.channel_indices[t]], own)
+        return out

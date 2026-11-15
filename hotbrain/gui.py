@@ -15,15 +15,16 @@ import pyqtgraph as pg
 from PySide6.QtCore import QPointF, QRect, QRectF, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QFont, QImageReader, QKeySequence, QLinearGradient, QPainter, QPainterPath, QPen, QPixmap, QShortcut
 from PySide6.QtWidgets import (
-    QApplication, QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog, QFormLayout, QFrame, QGridLayout,
-    QHBoxLayout, QLabel, QLineEdit, QMainWindow, QMessageBox, QPushButton, QScrollArea, QSpinBox, QVBoxLayout,
+    QApplication, QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog, QFormLayout, QFrame, QGridLayout, QGroupBox,
+    QHBoxLayout, QLabel, QLayout, QLineEdit, QMainWindow, QMessageBox, QPushButton, QScrollArea, QSizePolicy, QSpinBox,
+    QVBoxLayout,
     QWidget, QTableWidget, QTableWidgetItem, QTabWidget, QToolTip,
 )
 
 from . import classifiers
 from .acquisition import DeviceManager
 from .config import CONFIG, AppConfig
-from .dataset import Dataset, StimulusImage, load_dataset, rethreshold
+from .dataset import IMAGE_SUFFIXES, Dataset, StimulusImage, load_dataset, rethreshold
 from .features import EpochSpec, FeatureExtractor, TargetFeatures
 from .report import build_report, clone_trainers, write_report
 from .quality import ChannelQuality, SignalQuality
@@ -32,9 +33,57 @@ from .affect_plane import AffectPlane
 from .sessions import (SESSION_CALIBRATION, SESSION_RESTING, SESSION_TEST, SESSION_TRAINING, SESSION_VALIDATION,
                        OncePlan, Smoother, ValidationScores, affect_point, calibration_images, load_models,
                        sliding_windows, split_dataset)
+from .taste import TASTE_EXPERIMENT, TASTE_NAME
 
 CURVE_COLORS = ("#6dd7bf", "#8bb9ff", "#ffb86b", "#ff727a", "#c79bff", "#f4e06d", "#7fe08a", "#ff9ed8")
 EVAL_PREQUENTIAL = "prequential"
+
+# Dark theme shared by the three windows. Accent colours match the curve palette.
+STYLE = """
+QMainWindow, QWidget { background: #172131; color: #e6edf9; font-size: 13px; }
+QLabel#heading { font-size: 22px; font-weight: 700; margin: 2px 0 6px; color: #f4f7ff; }
+QLabel#hint { color: #9fb0c8; font-size: 12px; }
+QLabel#warning { color: #ffb86b; }
+QLabel#status { font-size: 15px; font-weight: 600; color: #f4f7ff; }
+QLabel#blocker { color: #ff8f8f; font-weight: 600; }
+QGroupBox { border: 1px solid #2c3d57; border-radius: 9px; margin-top: 14px; padding: 12px 10px 10px;
+            background: #1b2739; font-weight: 600; }
+QGroupBox::title { subcontrol-origin: margin; left: 12px; padding: 0 6px; color: #8bb9ff; }
+QGroupBox QWidget { background: transparent; font-weight: 400; }
+QGroupBox QLabel { background: transparent; }
+QPushButton { background: #29466c; border: 1px solid #355a88; border-radius: 7px; padding: 7px 14px; }
+QPushButton:hover { background: #376293; }
+QPushButton:disabled { background: #2a3547; border-color: #2f3b4f; color: #7d8aa0; }
+QPushButton#primary { background: #1f8f74; border-color: #2bb293; font-weight: 700; }
+QPushButton#primary:hover { background: #25a585; }
+QPushButton#primary:disabled { background: #2a3547; border-color: #2f3b4f; color: #7d8aa0; }
+QPushButton#danger { background: #8f2f3a; border-color: #b4414e; font-weight: 700; }
+QPushButton#danger:hover { background: #a83847; }
+QPushButton#danger:disabled { background: #2a3547; border-color: #2f3b4f; color: #7d8aa0; }
+QSpinBox, QDoubleSpinBox, QComboBox, QLineEdit { background: #223249; border: 1px solid #3e5372;
+            border-radius: 5px; padding: 4px 6px; min-height: 20px; }
+QSpinBox:focus, QDoubleSpinBox:focus, QComboBox:focus, QLineEdit:focus { border-color: #6dd7bf; }
+QSpinBox:disabled, QDoubleSpinBox:disabled, QComboBox:disabled, QLineEdit:disabled { color: #7d8aa0; }
+QComboBox QAbstractItemView { background: #223249; selection-background-color: #376293; }
+QCheckBox { spacing: 7px; }
+QCheckBox:disabled { color: #6f7c92; }
+QCheckBox::indicator { width: 14px; height: 14px; border: 1px solid #6a83a8; border-radius: 4px; background: #223249; }
+QCheckBox::indicator:hover { border-color: #8bb9ff; }
+QCheckBox::indicator:checked { background: #2bb293; border-color: #6dd7bf; }
+QCheckBox::indicator:disabled { background: #1d2738; border-color: #3a4659; }
+QCheckBox::indicator:checked:disabled { background: #3d6b62; border-color: #4b7d73; }
+QTabWidget::pane { border: 1px solid #2c3d57; border-radius: 7px; top: -1px; background: #1e2b3f; }
+QTabBar::tab { background: #1b2739; border: 1px solid #2c3d57; padding: 7px 16px; margin-right: 2px;
+               border-top-left-radius: 6px; border-top-right-radius: 6px; color: #9fb0c8; }
+QTabBar::tab:selected { background: #1e2b3f; color: #f4f7ff; border-bottom-color: #1e2b3f; font-weight: 600; }
+QTableWidget { background: #141d2b; gridline-color: #2c3d57; border: 1px solid #2c3d57; border-radius: 6px; }
+QHeaderView::section { background: #223249; color: #c9d6ea; border: none; padding: 5px; font-weight: 600; }
+QScrollArea { background: transparent; }
+QScrollBar:vertical { background: #172131; width: 10px; }
+QScrollBar::handle:vertical { background: #34496a; border-radius: 5px; min-height: 30px; }
+QScrollBar::add-line, QScrollBar::sub-line { height: 0; width: 0; }
+QToolTip { background: #223249; color: #e6edf9; border: 1px solid #3e5372; }
+"""
 EVAL_SPLIT = "split"
 
 
@@ -62,6 +111,15 @@ class Stimulus(QWidget):
         self._emit_on_paint = True
         self.update()
 
+    def neutral(self, path: Path):
+        """Neutral control image between trials: drawn like a stimulus but never marked as an onset."""
+        self.pixmap = QPixmap(str(path))
+        if self.pixmap.isNull():
+            raise ValueError(f"Cannot display neutral image: {path.name}")
+        self.state = "neutral"
+        self._emit_on_paint = False
+        self.update()
+
     def idle(self):
         self.state = "idle"
         self._emit_on_paint = False
@@ -70,7 +128,7 @@ class Stimulus(QWidget):
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.fillRect(self.rect(), QColor("#101827"))
-        if self.state == "image":
+        if self.state in ("image", "neutral"):
             size = self.pixmap.size()
             size.scale(self.rect().adjusted(24, 24, -24, -24).size(), Qt.AspectRatioMode.KeepAspectRatio)
             target = self.rect()
@@ -95,6 +153,7 @@ class PresentationPanel(QWidget):
         layout = QVBoxLayout(self)
         heading = QLabel("Stimulus presentation")
         heading.setObjectName("heading")
+        heading.setWordWrap(True)
         layout.addWidget(heading)
         row = QHBoxLayout()
         self.stimulus = Stimulus()
@@ -107,12 +166,195 @@ class PresentationPanel(QWidget):
         self.note = QLabel()
         self.note.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.note.setWordWrap(True)
+        self.note.setObjectName("hint")
         layout.addWidget(self.note)
-        self.set_timing(2.0, 3.0, EpochSpec(image_duration_ms=3000))
 
-    def set_timing(self, fixation_min: float, fixation_max: float, spec: EpochSpec):
-        self.note.setText(f"Fixation: {fixation_min:g}–{fixation_max:g} s   ·   Image: {spec.image_duration_ms / 1000:g} s   ·   "
-                          f"EEG epoch: {spec.start_ms} to +{spec.end_ms} ms (baseline to {spec.baseline_end_ms} ms)")
+    def set_timing(self, text: str):
+        self.note.setText(text)
+
+
+BETWEEN_FIXATION = "fixation"
+BETWEEN_NEUTRAL = "neutral"
+
+FEATURE_LABELS = {
+    "band_power": ("Band power", "log power per electrode × band"),
+    "fractal_dimension": ("Higuchi fractal dim.", "Higuchi fractal dimension per electrode"),
+    "region_band_power": ("Region band power", "log power averaged over each scalp region × band"),
+    "asymmetry": ("Asymmetry (right − left)", "right-minus-left log power per electrode pair × band (C4–C3, PO8–PO7)"),
+    "beta_alpha_ratio": ("β/α ratio", "log(beta) − log(alpha) per electrode; needs both bands"),
+    "hjorth": ("Hjorth parameters", "Hjorth mobility and complexity per electrode"),
+    "katz_fd": ("Katz fractal dim.", "Katz fractal dimension per electrode"),
+    "petrosian_fd": ("Petrosian fractal dim.", "Petrosian fractal dimension per electrode"),
+    "variance": ("Variance", "log variance per electrode"),
+    "erp": ("ERP amplitude", "mean evoked amplitude per region × time window"),
+}
+
+
+def _section(title: str) -> tuple[QGroupBox, QFormLayout]:
+    box = QGroupBox(title)
+    form = QFormLayout(box)
+    form.setLabelAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+    form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
+    form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapLongRows)
+    form.setHorizontalSpacing(12)
+    form.setVerticalSpacing(8)
+    return box, form
+
+
+def _row(*widgets, stretch: bool = True) -> QWidget:
+    holder = QWidget()
+    layout = QHBoxLayout(holder)
+    layout.setContentsMargins(0, 0, 0, 0)
+    layout.setSpacing(8)
+    for widget in widgets:
+        layout.addWidget(QLabel(widget) if isinstance(widget, str) else widget)
+    if stretch:
+        layout.addStretch()
+    return holder
+
+
+def _hint(text: str = "") -> QLabel:
+    label = QLabel(text)
+    label.setWordWrap(True)
+    label.setObjectName("hint")
+    return label
+
+
+def _seconds(low: float, high: float, value: float, step: float = .5) -> QDoubleSpinBox:
+    box = QDoubleSpinBox()
+    box.setRange(low, high)
+    box.setDecimals(2)
+    box.setSingleStep(step)
+    box.setSuffix(" s")
+    box.setValue(value)
+    return box
+
+
+class TargetEditor(QWidget):
+    """Electrodes, bands, feature families, analysis window and classifiers of one target."""
+    changed = Signal()          # feature settings changed (feature vector must be rebuilt)
+    models_changed = Signal()   # classifier selection changed
+
+    def __init__(self, target, eeg, default_classifiers: tuple[str, ...], train_by_default: bool):
+        super().__init__()
+        self.target = target.name
+        self.eeg = eeg
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(6, 10, 6, 6)
+        form = QFormLayout()
+        # Labels above their fields: the target tabs stay narrow enough for a 40% wide window.
+        form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapAllRows)
+        form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
+        form.setVerticalSpacing(4)
+
+        electrodes = QWidget()
+        grid = QGridLayout(electrodes)
+        grid.setContentsMargins(0, 0, 0, 0)
+        self.electrode_boxes: list[QCheckBox] = []
+        for index, (channel, name) in enumerate(zip(eeg.device_channels, eeg.electrodes, strict=True)):
+            box = QCheckBox(f"{channel + 1} · {name}")
+            box.setToolTip(f"Use Unicorn electrode {channel + 1} ({name}) for {self.target} features")
+            grid.addWidget(box, index // 4, index % 4)
+            self.electrode_boxes.append(box)
+        form.addRow("Electrodes", electrodes)
+
+        bands = QWidget()
+        grid = QGridLayout(bands)
+        grid.setContentsMargins(0, 0, 0, 0)
+        self.band_boxes: dict[str, QCheckBox] = {}
+        for index, (name, (lo, hi)) in enumerate(eeg.bands_hz):
+            box = QCheckBox(f"{name} {lo:g}–{hi:g} Hz")
+            grid.addWidget(box, index // 2, index % 2)
+            self.band_boxes[name] = box
+        form.addRow("Bands", bands)
+
+        families = QWidget()
+        grid = QGridLayout(families)
+        grid.setContentsMargins(0, 0, 0, 0)
+        self.feature_boxes: dict[str, QCheckBox] = {}
+        for index, family in enumerate(eeg.FEATURE_FAMILIES):
+            label, tip = FEATURE_LABELS.get(family, (family, family))
+            box = QCheckBox(label)
+            box.setToolTip(tip)
+            grid.addWidget(box, index // 2, index % 2)
+            self.feature_boxes[family] = box
+        form.addRow("Features", families)
+
+        self.window = QSpinBox()
+        self.window.setRange(0, 120000)
+        self.window.setSingleStep(50)
+        self.window.setSuffix(" ms after onset")
+        self.window.setSpecialValueText("whole image")
+        self.window.setToolTip("Post-onset part of each image this target analyses (0 = whole image, until 300 ms "
+                               "before it disappears). Shorter windows capture the evoked response; the whole image "
+                               "captures the sustained state.")
+        form.addRow("Analysis window", self.window)
+
+        models = QWidget()
+        grid = QGridLayout(models)
+        grid.setContentsMargins(0, 0, 0, 0)
+        self.model_boxes: dict[str, QCheckBox] = {}
+        for index, (key, spec) in enumerate(classifiers.CLASSIFIERS.items()):
+            box = QCheckBox(spec.label)
+            box.setChecked(train_by_default and key in default_classifiers)
+            grid.addWidget(box, index, 0)
+            self.model_boxes[key] = box
+            box.toggled.connect(self.update_model_limit)
+            box.toggled.connect(self.models_changed)
+        form.addRow("Classifiers (≤ 3)", models)
+        layout.addLayout(form)
+        self.summary = _hint()
+        layout.addWidget(self.summary)
+        layout.addStretch()
+        for box in (*self.electrode_boxes, *self.band_boxes.values(), *self.feature_boxes.values()):
+            box.toggled.connect(self.changed)
+        self.window.valueChanged.connect(self.changed)
+        self.update_model_limit()
+
+    def widgets(self) -> list[QWidget]:
+        return [*self.electrode_boxes, *self.band_boxes.values(), *self.feature_boxes.values(), self.window,
+                *self.model_boxes.values()]
+
+    def load(self, spec):
+        """Fill the controls from a preset's TargetFeatureSpec without emitting ``changed`` per control."""
+        wanted = set(self.eeg.electrodes if spec.electrodes is None else spec.electrodes)
+        controls = [*self.electrode_boxes, *self.band_boxes.values(), *self.feature_boxes.values(), self.window]
+        for widget in controls:
+            widget.blockSignals(True)
+        for box, name in zip(self.electrode_boxes, self.eeg.electrodes, strict=True):
+            box.setChecked(name in wanted)
+        for name, box in self.band_boxes.items():
+            box.setChecked(name in spec.bands)
+        for family, box in self.feature_boxes.items():
+            box.setChecked(family in spec.features)
+        self.window.setValue(0 if spec.window_ms is None else spec.window_ms)
+        for widget in controls:
+            widget.blockSignals(False)
+
+    def spec(self):
+        from .config import TargetFeatureSpec
+        window = self.window.value()
+        return TargetFeatureSpec(
+            tuple(name for box, name in zip(self.electrode_boxes, self.eeg.electrodes, strict=True) if box.isChecked()),
+            tuple(name for name, box in self.band_boxes.items() if box.isChecked()),
+            tuple(family for family, box in self.feature_boxes.items() if box.isChecked()),
+            None if window == 0 else max(100, window))
+
+    def selected_models(self) -> list[str]:
+        return [key for key, box in self.model_boxes.items() if box.isChecked()]
+
+    def update_model_limit(self):
+        checked = len(self.selected_models())
+        if not self.isEnabled():
+            return
+        for box in self.model_boxes.values():
+            box.setEnabled(box.isChecked() or checked < 3)
+
+    def set_editable(self, editable: bool):
+        for widget in self.widgets():
+            widget.setEnabled(editable)
+        if editable:
+            self.update_model_limit()
 
 
 class TrainingPanel(QWidget):
@@ -125,14 +367,21 @@ class TrainingPanel(QWidget):
         super().__init__()
         self.n_groups = config.n_trial_groups
         self.class1_names = {target.name: target.classes[1] for target in config.targets}
+        presentation = config.presentation or {}
         layout = QVBoxLayout(self)
+        layout.setContentsMargins(14, 10, 14, 10)
+        layout.setSpacing(8)
         self.heading = QLabel("Scene emotion training")
         self.heading.setObjectName("heading")
+        self.heading.setWordWrap(True)
         layout.addWidget(self.heading)
         self.settings_widget = QWidget()
         settings_layout = QVBoxLayout(self.settings_widget)
-        settings_layout.setContentsMargins(0, 0, 0, 0)
-        form = QFormLayout()
+        settings_layout.setContentsMargins(0, 0, 6, 0)
+        settings_layout.setSpacing(12)
+
+        # --- Session -------------------------------------------------------------------
+        box, form = _section("Session")
         self.session = QComboBox()
         for key, label, tip in ((SESSION_TRAINING, "Training", "models learn trial by trial"),
                                 (SESSION_VALIDATION, "Validation", "held-out images, each once; frozen models"),
@@ -142,211 +391,274 @@ class TrainingPanel(QWidget):
                                 (SESSION_RESTING, "Resting baseline", "eyes-open resting reference recording")):
             self.session.addItem(label, key)
             self.session.setItemData(self.session.count() - 1, tip, Qt.ItemDataRole.ToolTipRole)
-        form.addRow("Session", self.session)
-        self.configuration = QComboBox()
-        for profile in config.profiles:
-            self.configuration.addItem(f"{profile.number} · {profile.name}", profile.number)
-        self.configuration.setCurrentIndex(self.configuration.findData(config.default_profile))
-        self.configuration.setToolTip("Feature configuration: per-target electrodes, bands, feature families "
-                                      "and analysis window (CONFIG['profiles']).")
-        form.addRow("Configuration", self.configuration)
-        models_row = QHBoxLayout()
+        form.addRow("Session type", self.session)
+        self.participant = QLineEdit("debug")
+        self.participant.setPlaceholderText("Participant ID")
+        form.addRow("Participant ID", self.participant)
         self.load_models = QPushButton("Load saved models…")
-        self.models_status = QLabel("No trained models yet.")
-        self.models_status.setWordWrap(True)
-        models_row.addWidget(self.load_models)
-        models_row.addWidget(self.models_status, 1)
-        form.addRow("Models", models_row)
+        self.models_status = _hint("No trained models yet.")
+        form.addRow("Saved models", _row(self.load_models))
+        form.addRow("", self.models_status)
         self.feedback_classifier = QComboBox()
         self.feedback_classifier.setToolTip("Classifier whose valence/arousal estimate drives the live plane "
                                             "in validation and test sessions.")
         form.addRow("Live display uses", self.feedback_classifier)
         self.practice = QCheckBox(f"Practice test run ({config.practice_images} images)")
         self.practice.setToolTip("Short test run to get used to the feedback; saved with a practice_ prefix.")
-        form.addRow("Test", self.practice)
-        self.participant = QLineEdit("debug")
-        self.participant.setPlaceholderText("Participant ID")
-        form.addRow("Participant ID", self.participant)
-        self.serial = QLineEdit("UN-2019.03.01")
-        self.serial.setPlaceholderText("Blank = first available Unicorn")
-        form.addRow("Unicorn serial", self.serial)
-        self.count = QSpinBox()
-        self.count.setRange(self.n_groups, 100000)
-        self.count.setSingleStep(self.n_groups)
-        self.count.setValue(max(self.n_groups, 160 - 160 % self.n_groups))
-        form.addRow("Presentations", self.count)
-        self.persistent = QCheckBox("Continue until manually stopped")
-        self.persistent.toggled.connect(self.count.setDisabled)
-        form.addRow("Mode", self.persistent)
-        self.evaluation = QComboBox()
-        self.evaluation.addItem("Prequential · no repeated images", EVAL_PREQUENTIAL)
-        self.evaluation.addItem(f"Hold out {round(config.validation_fraction * 100)}% for validation", EVAL_SPLIT)
-        form.addRow("Evaluation", self.evaluation)
-        self.evaluation_status = QLabel()
-        self.evaluation_status.setWordWrap(True)
-        form.addRow("", self.evaluation_status)
-        self.image_seconds = QDoubleSpinBox()
-        self.image_seconds.setRange(min_image_s, 60.0)
-        self.image_seconds.setDecimals(2)
-        self.image_seconds.setSingleStep(.1)
-        self.image_seconds.setSuffix(" s")
-        self.image_seconds.setValue(max(3.0, min_image_s))
+        form.addRow("", self.practice)
+        settings_layout.addWidget(box)
+
+        # --- Presentation ----------------------------------------------------------------
+        box, form = _section("Image presentation")
+        self.presentation_form = form
+        self.image_seconds = _seconds(min_image_s, 120.0, max(float(presentation.get("image_s", 20.0)), min_image_s))
         form.addRow("Image duration", self.image_seconds)
-        self.fixation_min = QDoubleSpinBox()
-        self.fixation_min.setRange(.2, 60.0)
-        self.fixation_min.setDecimals(2)
-        self.fixation_min.setSingleStep(.1)
-        self.fixation_min.setSuffix(" s")
-        self.fixation_min.setValue(2.0)
-        form.addRow("Fixation minimum", self.fixation_min)
-        self.fixation_max = QDoubleSpinBox()
-        self.fixation_max.setRange(.2, 60.0)
-        self.fixation_max.setDecimals(2)
-        self.fixation_max.setSingleStep(.1)
-        self.fixation_max.setSuffix(" s")
-        self.fixation_max.setValue(3.0)
-        form.addRow("Fixation maximum", self.fixation_max)
-        self.stop_key = QComboBox()
-        self.stop_key.addItems(["Escape", "Space", "Enter", *[f"F{i}" for i in range(1, 13)],
-                                *"ABCDEFGHIJKLMNOPQRSTUVWXYZ", *"0123456789"])
-        form.addRow("Stop key", self.stop_key)
-        self.oscar = QCheckBox("Enable g.Pype OSCAR artifact removal")
-        self.oscar.setChecked(True)
-        form.addRow("EEG processing", self.oscar)
-        electrode_grid = QWidget()
-        electrode_layout = QGridLayout(electrode_grid)
-        electrode_layout.setContentsMargins(0, 0, 0, 0)
-        self.electrode_boxes: list[QCheckBox] = []
-        for index, (channel, name) in enumerate(zip(config.eeg.device_channels, config.eeg.electrodes, strict=True)):
-            box = QCheckBox(f"{channel + 1} · {name}")
-            box.setChecked(True)
-            box.setToolTip(f"Use Unicorn electrode {channel + 1} ({name}) for model features")
-            electrode_layout.addWidget(box, index // 4, index % 4)
-            self.electrode_boxes.append(box)
-        form.addRow("Model electrodes", electrode_grid)
-        self.electrode_status = QLabel("All eight electrodes enter model features; diagnostics show all eight.")
-        self.electrode_status.setWordWrap(True)
-        form.addRow("", self.electrode_status)
-        self.warmup = QCheckBox("Wait before trials (not OSCAR calibration)")
+        self.between = QComboBox()
+        self.between.addItem("Fixation cross", BETWEEN_FIXATION)
+        self.between.addItem("Neutral image (control condition)", BETWEEN_NEUTRAL)
+        self.between.setCurrentIndex(self.between.findData(presentation.get("between", BETWEEN_FIXATION)))
+        self.between.setToolTip("What the participant sees between two images.")
+        form.addRow("Between images", self.between)
+        fixation = presentation.get("fixation_s", [2.0, 3.0])
+        self.fixation_min = _seconds(.2, 60.0, float(fixation[0]), .1)
+        self.fixation_max = _seconds(.2, 60.0, float(fixation[1]), .1)
+        self.fixation_row = _row(self.fixation_min, "to", self.fixation_max, _hint("random per trial"))
+        form.addRow("Fixation", self.fixation_row)
+        self.neutral_seconds = _seconds(1.0, 120.0, float(presentation.get("neutral_s", 20.0)))
+        self.neutral_status = _hint()
+        self.neutral_row = _row(self.neutral_seconds, self.neutral_status)
+        form.addRow("Neutral image", self.neutral_row)
+        self.warmup = QCheckBox("Wait before the first trial")
         self.warmup.setChecked(True)
-        form.addRow("Before trials", self.warmup)
+        self.warmup.setToolTip("Fixation-cross wait at the start of a run, e.g. while OSCAR adapts "
+                               "(not an OSCAR calibration).")
         self.warmup_seconds = QSpinBox()
         self.warmup_seconds.setRange(2, 120)
         self.warmup_seconds.setValue(12)
         self.warmup_seconds.setSuffix(" s")
-        form.addRow("Waiting duration", self.warmup_seconds)
-        model_grid = QWidget()
-        model_layout = QGridLayout(model_grid)
-        model_layout.setContentsMargins(0, 0, 0, 0)
-        self.train_boxes: dict[tuple[str, str], QCheckBox] = {}
-        stride = 1 + -(-len(classifiers.CLASSIFIERS) // 2)
-        for target_index, target in enumerate(config.targets):
-            row = target_index * stride
-            model_layout.addWidget(QLabel(f"{target.name.title()} ({target.classes[1]})"), row, 0, 1, 2)
-            for index, (key, spec) in enumerate(classifiers.CLASSIFIERS.items()):
-                box = QCheckBox(spec.label)
-                box.setChecked(target.name == "valence" and key in config.classifiers)
-                self.train_boxes[(target.name, key)] = box
-                model_layout.addWidget(box, row + 1 + index // 2, index % 2)
-                box.toggled.connect(self.update_model_limit)
-        form.addRow("Train target / model", model_grid)
-        self.update_model_limit()
-        model_note = QLabel("Choose up to three models for each target. Valence and arousal are separate "
-                            "classifiers, each with its own features from the selected configuration. "
-                            "Each predicts before refitting.")
-        model_note.setWordWrap(True)
-        form.addRow("", model_note)
-        stop_row = QHBoxLayout()
+        form.addRow("Start of run", _row(self.warmup, self.warmup_seconds))
+        self.stop_key = QComboBox()
+        self.stop_key.addItems(["Escape", "Space", "Enter", *[f"F{i}" for i in range(1, 13)],
+                                *"ABCDEFGHIJKLMNOPQRSTUVWXYZ", *"0123456789"])
+        form.addRow("Stop key", self.stop_key)
+        settings_layout.addWidget(box)
+
+        # --- Trials and evaluation ----------------------------------------------------------
+        box, form = _section("Trials and evaluation")
+        self.count = QSpinBox()
+        self.count.setRange(self.n_groups, 100000)
+        self.count.setSingleStep(self.n_groups)
+        self.count.setValue(max(self.n_groups, 160 - 160 % self.n_groups))
+        self.persistent = QCheckBox("until stopped")
+        self.persistent.toggled.connect(self.count.setDisabled)
+        form.addRow("Presentations", _row(self.count, self.persistent))
+        self.evaluation = QComboBox()
+        self.evaluation.addItem("Prequential · no repeated images", EVAL_PREQUENTIAL)
+        self.evaluation.addItem(f"Hold out {round(config.validation_fraction * 100)}% for validation", EVAL_SPLIT)
+        form.addRow("Evaluation", self.evaluation)
+        self.evaluation_status = _hint()
+        form.addRow("", self.evaluation_status)
         rule = config.stop_rule
-        self.stop_rule = QCheckBox(f"Stop when {rule['target']} rolling balanced accuracy ≥")
+        self.stop_rule = QCheckBox("Stop early when")
         self.stop_rule.setChecked(bool(rule.get("enabled")))
+        self.stop_rule_target = QComboBox()
+        for target in config.targets:
+            self.stop_rule_target.addItem(target.name, target.name)
+        self.stop_rule_target.setCurrentIndex(max(0, self.stop_rule_target.findData(rule["target"])))
         self.stop_rule_threshold = QDoubleSpinBox()
         self.stop_rule_threshold.setRange(50.0, 100.0)
         self.stop_rule_threshold.setSuffix(" %")
         self.stop_rule_threshold.setValue(float(rule["balanced_accuracy"]))
-        stop_row.addWidget(self.stop_rule)
-        stop_row.addWidget(self.stop_rule_threshold)
-        stop_row.addWidget(QLabel(f"over {rule['min_predictions']} predictions"))
-        stop_row.addStretch()
-        form.addRow("Stopping rule", stop_row)
-        settings_layout.addLayout(form)
-        self.dataset_status = QLabel()
-        self.dataset_status.setWordWrap(True)
-        settings_layout.addWidget(self.dataset_status)
+        form.addRow("Stopping rule", _row(self.stop_rule, self.stop_rule_target))
+        form.addRow("", _row("balanced accuracy ≥", self.stop_rule_threshold))
+        form.addRow("", _hint(f"Rolling balanced accuracy over the last {rule['min_predictions']} predictions "
+                              "of any model of that target."))
+        settings_layout.addWidget(box)
+
+        # --- Features and classifiers per target --------------------------------------------------
+        box = QGroupBox("Features and classifiers · set separately for each target")
+        target_layout = QVBoxLayout(box)
+        target_layout.setSpacing(8)
+        self.configuration = QComboBox()
+        for profile in config.profiles:
+            self.configuration.addItem(f"{profile.number} · {profile.name}", profile.number)
+        # Alternative experiment (sweet vs salty taste, hotbrain/taste_gui.py): opens its own windows.
+        self.configuration.insertSeparator(self.configuration.count())
+        self.configuration.addItem(TASTE_NAME, TASTE_EXPERIMENT)
+        self.configuration.setItemData(self.configuration.count() - 1,
+                                       "Alternative experiment: classify sweet vs salty taste from EEG "
+                                       "(opens the taste windows; the headset stays connected).",
+                                       Qt.ItemDataRole.ToolTipRole)
+        self.configuration.setCurrentIndex(self.configuration.findData(config.default_profile))
+        self.configuration.setToolTip("Preset (CONFIG['profiles']): fills in electrodes, bands, feature families "
+                                      "and analysis window for every target. Edit any of them afterwards.")
+        self.apply_preset = QPushButton("Reset to preset")
+        self.apply_preset.setToolTip("Discard per-target edits and reload the selected preset.")
+        preset_row = QHBoxLayout()
+        preset_row.addWidget(QLabel("Preset"))
+        preset_row.addWidget(self.configuration, 1)
+        preset_row.addWidget(self.apply_preset)
+        target_layout.addLayout(preset_row)
+        self.target_tabs = QTabWidget()
+        self.target_editors: dict[str, TargetEditor] = {}
+        for index, target in enumerate(config.targets):
+            editor = TargetEditor(target, config.eeg, config.classifiers, train_by_default=index == 0)
+            editor.models_changed.connect(self.update_model_limit)
+            self.target_editors[target.name] = editor
+            self.target_tabs.addTab(editor, f"{target.name.title()}  ({target.classes[0]} / {target.classes[1]})")
+        target_layout.addWidget(self.target_tabs)
+        self.train_boxes: dict[tuple[str, str], QCheckBox] = {
+            (name, key): box for name, editor in self.target_editors.items() for key, box in editor.model_boxes.items()}
+        self.electrode_status = _hint()
+        target_layout.addWidget(self.electrode_status)
+        self.shared_note = _hint()
+        target_layout.addWidget(self.shared_note)
+        settings_layout.addWidget(box)
+
+        # --- Headset -------------------------------------------------------------------------------
+        box, form = _section("Headset")
+        self.serial = QLineEdit("UN-2019.03.01")
+        self.serial.setPlaceholderText("Blank = first available Unicorn")
+        form.addRow("Unicorn serial", self.serial)
+        self.oscar = QCheckBox("g.Pype OSCAR artifact removal")
+        self.oscar.setChecked(True)
+        form.addRow("EEG processing", self.oscar)
+        settings_layout.addWidget(box)
+
+        # --- Images --------------------------------------------------------------------------------
+        box = QGroupBox("Images")
+        images_layout = QVBoxLayout(box)
+        self.dataset_status = _hint()
+        images_layout.addWidget(self.dataset_status)
         self.refresh_images = QPushButton("Refresh image counts")
-        settings_layout.addWidget(self.refresh_images)
+        images_layout.addWidget(_row(self.refresh_images))
         self.config_note = QLabel()
         self.config_note.setWordWrap(True)
         self.config_note.setObjectName("warning")
-        settings_layout.addWidget(self.config_note)
-        balance = f"the {config.balance_by} classes" if config.balance_by else f"the {self.n_groups} dataset folders"
-        self.detail = QLabel(f"Finite runs are exactly balanced across {balance} and shuffled; "
-                             "continuous runs draw a group uniformly at random. Each target/classifier pair predicts a trial "
-                             "before that trial is added to its fit. OSCAR adapts online; g.Pype does not expose a saved calibration state.")
-        self.detail.setWordWrap(True)
-        settings_layout.addWidget(self.detail)
+        images_layout.addWidget(self.config_note)
+        balance = (f"the {self.n_groups} stimulus conditions ({', '.join(c.name for c in config.conditions)})"
+                   if config.balance_by == "conditions" else
+                   f"the {config.balance_by} classes" if config.balance_by else f"the {self.n_groups} dataset folders")
+        self.detail = _hint(f"Finite runs are exactly balanced across {balance} and shuffled; continuous runs draw a "
+                            "group uniformly at random. Each target/classifier pair predicts a trial before that "
+                            "trial is added to its fit. OSCAR adapts online; g.Pype does not expose a saved "
+                            "calibration state.")
+        images_layout.addWidget(self.detail)
+        settings_layout.addWidget(box)
+        settings_layout.addStretch()
+
         self.settings_scroll = QScrollArea()
         self.settings_scroll.setFrameShape(QFrame.Shape.NoFrame)
         self.settings_scroll.setWidgetResizable(True)
-        self.settings_scroll.setMaximumHeight(420)
+        self.settings_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         self.settings_scroll.setWidget(self.settings_widget)
-        layout.addWidget(self.settings_scroll)
+        self.settings_scroll.setMinimumWidth(0)
+        layout.addWidget(self.settings_scroll, 3)
+
+        # --- Run controls ----------------------------------------------------------------------------
         buttons = QHBoxLayout()
-        self.start = QPushButton("Start session")
-        self.stop = QPushButton("Stop session")
+        self.start = QPushButton("▶  Start session")
+        self.start.setObjectName("primary")
+        self.stop = QPushButton("■  Stop")
+        self.stop.setObjectName("danger")
         self.save = QPushButton("Save results")
         self.discard = QPushButton("Discard run")
         self.stop.setEnabled(False)
         self.save.setEnabled(False)
         self.discard.setEnabled(False)
         for button in (self.start, self.stop, self.save, self.discard):
-            buttons.addWidget(button)
+            # Let the buttons share a narrow window instead of forcing its minimum width.
+            button.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
+            buttons.addWidget(button, 2 if button is self.start else 1)
         layout.addLayout(buttons)
         self.start_hint = QLabel("")
         self.start_hint.setWordWrap(True)
-        self.start_hint.setStyleSheet("color: #c0392b;")
+        self.start_hint.setObjectName("blocker")
         layout.addWidget(self.start_hint)
-        self.stop_hint = QLabel("Press Escape in any app window to stop training.")
-        self.stop_key.currentTextChanged.connect(
-            lambda key: self.stop_hint.setText(f"Press {key} in any app window to stop training."))
-        self.stop_hint.setWordWrap(True)
-        layout.addWidget(self.stop_hint)
-        self.start.clicked.connect(self.start_requested)
-        self.stop.clicked.connect(self.stop_requested)
-        self.save.clicked.connect(self.save_requested)
-        self.discard.clicked.connect(self.discard_requested)
         self.status = QLabel("Ready")
         self.status.setObjectName("status")
         self.status.setWordWrap(True)
         layout.addWidget(self.status)
-        self.device_status = QLabel("Checking for Unicorn…")
-        self.device_status.setWordWrap(True)
+        self.device_status = _hint("Checking for Unicorn…")
         layout.addWidget(self.device_status)
         self.count_status = QLabel("Trials: 0 · usable EEG: 0")
-        layout.addWidget(self.count_status)
+        self.count_status.setObjectName("hint")
+        self.stop_hint = _hint("Stop key: Escape (any app window)")
+        self.stop_hint.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        self.stop_key.currentTextChanged.connect(
+            lambda key: self.stop_hint.setText(f"Stop key: {key} (any app window)"))
+        layout.addWidget(_row(self.count_status, self.stop_hint))
+        self.start.clicked.connect(self.start_requested)
+        self.stop.clicked.connect(self.stop_requested)
+        self.save.clicked.connect(self.save_requested)
+        self.discard.clicked.connect(self.discard_requested)
+
+        # --- Results (shown once a run has started) -----------------------------------------------------
+        self.results = QWidget()
+        results_layout = QVBoxLayout(self.results)
+        results_layout.setContentsMargins(0, 0, 0, 0)
         self.accuracy = QTableWidget(0, 6)
         self.accuracy.setHorizontalHeaderLabels(("Target (+)", "Model", f"Last {ROLLING} correct", "N", "P(+)", "Save"))
         self.accuracy.horizontalHeader().setStretchLastSection(True)
-        for column, width in enumerate((100, 130, 125, 45, 75, 50)):
+        self.accuracy.verticalHeader().setVisible(False)
+        for column, width in enumerate((110, 150, 125, 45, 70, 50)):
             self.accuracy.setColumnWidth(column, width)
-        self.accuracy.setMaximumHeight(240)
-        layout.addWidget(self.accuracy)
+        self.accuracy.setMaximumHeight(220)
+        results_layout.addWidget(self.accuracy)
         self.plot = pg.PlotWidget()
-        self.plot.setBackground("#101827")
+        self.plot.setBackground("#0f1724")
         self.plot.setLabel("left", "Correct (rolling)", units="%")
         self.plot.setLabel("bottom", "Presented trial")
         self.plot.setYRange(0, 100)
         self.plot.showGrid(x=True, y=True, alpha=.2)
         self.plot.addLegend(offset=(-10, 10))
-        layout.addWidget(self.plot, 1)
+        self.plot.addLine(y=50, pen=pg.mkPen("#5b6b84", width=1, style=Qt.PenStyle.DashLine))
+        results_layout.addWidget(self.plot, 1)
         self.weights = QTableWidget(0, 1)
         self.weights.horizontalHeader().setStretchLastSection(True)
-        self.weights.setMaximumHeight(195)
-        layout.addWidget(self.weights)
+        self.weights.verticalHeader().setVisible(False)
+        self.weights.setMaximumHeight(180)
+        results_layout.addWidget(self.weights)
+        self.results.setVisible(False)
+        layout.addWidget(self.results, 2)
         self.model_keys: list[tuple[str, str]] = []
         self.save_boxes: dict[tuple[str, str], QCheckBox] = {}
         self.save_selection_ready = False
         self.curves: dict[tuple[str, str], tuple[object, list[int], list[float]]] = {}
+        self.between.currentIndexChanged.connect(self.update_between_rows)
+        for combo in self.settings_widget.findChildren(QComboBox):
+            # Long entries (preset names) must not widen the panel; the popup still shows them in full.
+            combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+            combo.setMinimumContentsLength(10)
+            combo.updateGeometry()
+        for child_layout in self.settings_widget.findChildren(QLayout):
+            child_layout.invalidate()
+        self.load_profile(config.profile(config.default_profile))
+        self.update_between_rows()
+
+    # ------------------------------------------------------------------ settings helpers
+    def load_profile(self, profile):
+        for name, editor in self.target_editors.items():
+            editor.load(profile.target(name))
+
+    def target_specs(self) -> dict:
+        return {name: editor.spec() for name, editor in self.target_editors.items()}
+
+    def between_mode(self) -> str:
+        return self.between.currentData()
+
+    def update_between_rows(self):
+        neutral = self.between_mode() == BETWEEN_NEUTRAL
+        self.presentation_form.setRowVisible(self.fixation_row, not neutral)
+        self.presentation_form.setRowVisible(self.neutral_row, neutral)
+
+    def input_widgets(self) -> list[QWidget]:
+        return [self.participant, self.serial, self.count, self.persistent, self.stop_key, self.oscar, self.warmup,
+                self.warmup_seconds, self.image_seconds, self.between, self.fixation_min, self.fixation_max,
+                self.neutral_seconds, self.evaluation, self.configuration, self.apply_preset, self.session,
+                self.load_models, self.refresh_images, self.feedback_classifier, self.practice, self.stop_rule,
+                self.stop_rule_target, self.stop_rule_threshold,
+                *[w for editor in self.target_editors.values() for w in editor.widgets()]]
 
     def heading_session(self, session: str):
         self.heading.setText({SESSION_TRAINING: "Scene emotion training",
@@ -357,6 +669,7 @@ class TrainingPanel(QWidget):
 
     def show_validation(self, scores: ValidationScores):
         """Validation accuracy per frozen model, with balanced accuracy and the majority-class baseline."""
+        self.results.setVisible(True)
         keys = sorted(scores.models)
         self.save_boxes = {}
         self.accuracy.setRowCount(len(keys))
@@ -376,19 +689,19 @@ class TrainingPanel(QWidget):
                 self.accuracy.setItem(row, col, QTableWidgetItem(text))
 
     def selected_model_pairs(self) -> list[tuple[str, str]]:
-        return [pair for pair, box in self.train_boxes.items() if box.isChecked()]
+        return [(name, key) for name, editor in self.target_editors.items() for key in editor.selected_models()]
 
-    def selected_electrode_positions(self) -> tuple[int, ...]:
-        return tuple(index for index, box in enumerate(self.electrode_boxes) if box.isChecked())
+    def selected_electrode_positions(self, target: str | None = None) -> tuple[int, ...]:
+        """Electrode positions used by ``target`` (default: by any target)."""
+        editors = [self.target_editors[target]] if target else self.target_editors.values()
+        return tuple(index for index in range(len(next(iter(self.target_editors.values())).electrode_boxes))
+                     if any(editor.electrode_boxes[index].isChecked() for editor in editors))
 
     def update_model_limit(self):
         if self.session.currentData() not in (SESSION_TRAINING, SESSION_CALIBRATION):
             return
-        for target in self.class1_names:
-            checked = sum(box.isChecked() for (name, _), box in self.train_boxes.items() if name == target)
-            for (name, _), box in self.train_boxes.items():
-                if name == target:
-                    box.setEnabled(box.isChecked() or checked < 3)
+        for editor in self.target_editors.values():
+            editor.update_model_limit()
 
     def selected_save_models(self) -> set[tuple[str, str]]:
         return {key for key, box in self.save_boxes.items() if box.isEnabled() and box.isChecked()}
@@ -413,6 +726,7 @@ class TrainingPanel(QWidget):
     def configure_models(self, model_keys: list[tuple[str, str]],
                          feature_names: tuple[str, ...] | dict[str, tuple[str, ...]]):
         """Reset the accuracy table, curves and weight table for a new run."""
+        self.results.setVisible(True)
         self.accuracy.setHorizontalHeaderLabels(("Target (+)", "Model", f"Last {ROLLING} correct", "N", "P(+)", "Save"))
         self.model_keys = list(model_keys)
         self.weight_rows = []
@@ -421,6 +735,7 @@ class TrainingPanel(QWidget):
         self.plot.clear()
         if self.plot.plotItem.legend is not None:
             self.plot.plotItem.legend.clear()
+        self.plot.addLine(y=50, pen=pg.mkPen("#5b6b84", width=1, style=Qt.PenStyle.DashLine))
         self.curves = {}
         self.accuracy.setRowCount(len(model_keys))
         for row, (target, clf) in enumerate(model_keys):
@@ -520,7 +835,7 @@ class ElectrodeMap(QWidget):
         self.channels = channels
         self.POSITIONS = electrode_positions(channels)
         self.ratings = [ChannelQuality(None, "Waiting for EEG") for _ in channels]
-        self.setMinimumHeight(260)
+        self.setMinimumHeight(190)
         self.setMaximumHeight(310)
         self.setMouseTracking(True)
 
@@ -626,15 +941,18 @@ class FeaturePanel(QWidget):
         layout = QVBoxLayout(self)
         heading = QLabel("EEG diagnostics and features")
         heading.setObjectName("heading")
+        heading.setWordWrap(True)
         layout.addWidget(heading)
         self.note = QLabel("Waiting for real Unicorn EEG. Diagnostics run before training.")
         self.note.setWordWrap(True)
         layout.addWidget(self.note)
-        self.oscar_toggle = QCheckBox("Use OSCAR artifact removal (reconnects EEG)")
+        self.oscar_toggle = QCheckBox("OSCAR artifact removal")
+        self.oscar_toggle.setToolTip("Use g.Pype OSCAR artifact removal; changing it reconnects the EEG stream.")
         self.oscar_toggle.setChecked(True)
         layout.addWidget(self.oscar_toggle)
         quality_title = QLabel("Electrode signal checks")
         quality_title.setObjectName("heading")
+        quality_title.setWordWrap(True)
         layout.addWidget(quality_title)
         self.quality_map = ElectrodeMap(channels)
         layout.addWidget(self.quality_map)
@@ -703,7 +1021,7 @@ class FeaturePanel(QWidget):
         # One small plot per electrode/band (shared, linked time axis; own y scale each).
         self.grid = pg.GraphicsLayoutWidget()
         self.grid.setBackground("#101827")
-        self.grid.setMinimumHeight(460)
+        self.grid.setMinimumHeight(220)
         feature_layout.addWidget(self.grid, 1)
         self.tabs.addTab(feature_page, "Features")
         self.plots: list = []
@@ -711,6 +1029,8 @@ class FeaturePanel(QWidget):
         self.shown: list[tuple[int, str]] = []
         self.samples: list[tuple[float, np.ndarray]] = []
         for widget in (self.mode, self.band, self.electrode, self.selector):
+            widget.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+            widget.setMinimumContentsLength(8)
             widget.currentIndexChanged.connect(self.select)
         self.select()
 
@@ -888,28 +1208,32 @@ def resting_reference(eeg, segment: np.ndarray, window_s: float = 2.0) -> dict:
 
 
 class MainWindow(QMainWindow):
-    def __init__(self, root: Path, config: dict | None = None):
+    def __init__(self, root: Path, config: dict | None = None, device=None):
         super().__init__()
         self.root = root
+        self.handed_over = False   # True once the EEG device belongs to another experiment's window
         self.config = AppConfig.from_dict(CONFIG if config is None else config, root)
         self.display_extractor = FeatureExtractor(self.config.eeg)
         # The live feature plot uses its own rolling 1.5 s window (de-meaned), independent of the model epochs.
         self.display_spec = EpochSpec(1500, self.config.eeg.fs, 1500, 0, None)
         self.profile_number = self.config.default_profile
-        self.model_channel_indices = tuple(range(len(self.config.eeg.electrodes)))
-        self.target_features = TargetFeatures(self.config.eeg, self.config.profile(self.profile_number),
-                                              self.model_channel_indices)
         self.quality = SignalQuality(self.config.eeg)
         self.setWindowTitle("Hot Brain · scene training")
         self.resize(720, 900)
-        self.training = TrainingPanel(self.config, min(TargetFeatures(self.config.eeg, p).min_image_duration_ms
-                                                       for p in self.config.profiles) / 1000)
+        self.training = TrainingPanel(self.config, 0.5)
+        self.target_features = TargetFeatures(self.config.eeg, self._current_profile())
+        self.neutral_images = self._load_neutral_images()
+        self.neutral_queue: list[Path] = []
+        self.pre_stimulus: dict | None = None
         self.device = None
         self.presentation = PresentationPanel()
         self.presentation.plane.on_target_distance = self.config.on_target_distance
         self.epoch_spec = self.target_features.epoch_spec(round(self.training.image_seconds.value() * 1000))
-        for control in (self.training.image_seconds, self.training.fixation_min, self.training.fixation_max):
+        for control in (self.training.image_seconds, self.training.fixation_min, self.training.fixation_max,
+                        self.training.neutral_seconds, self.training.count):
             control.valueChanged.connect(self.update_timing_note)
+        self.training.persistent.toggled.connect(self.update_timing_note)
+        self.training.between.currentIndexChanged.connect(self._on_between_changed)
         self.features = FeaturePanel(self.display_extractor)
         self.features.oscar_toggle.setChecked(self.training.oscar.isChecked())
         self.features.oscar_toggle.toggled.connect(self.training.oscar.setChecked)
@@ -929,7 +1253,7 @@ class MainWindow(QMainWindow):
         self.training.save_requested.connect(self.save_model)
         self.training.discard_requested.connect(self.discard_run)
         self.presentation.stimulus.onset.connect(self.on_image_onset)
-        self._make_device()
+        self._make_device(device)
         self.training.serial.editingFinished.connect(self.configure_device_from_controls)
         self.training.oscar.toggled.connect(self.configure_device_from_controls)
         warnings = self.config.eeg.warnings()
@@ -988,14 +1312,14 @@ class MainWindow(QMainWindow):
         self.run_start_clock = 0.0
         self.training.session.currentIndexChanged.connect(self._on_session_changed)
         self.training.configuration.currentIndexChanged.connect(self._on_configuration_changed)
+        self.training.apply_preset.clicked.connect(self._on_configuration_changed)
         self.training.persistent.toggled.connect(self._on_session_changed)
         self.training.persistent.toggled.connect(self._refresh_evaluation_options)
         self.training.count.valueChanged.connect(self._refresh_evaluation_options)
         self.training.evaluation.currentIndexChanged.connect(self._refresh_evaluation_options)
-        for box in self.training.electrode_boxes:
-            box.toggled.connect(self._on_electrodes_changed)
-        for box in self.training.train_boxes.values():
-            box.toggled.connect(self.update_start_availability)
+        for editor in self.training.target_editors.values():
+            editor.changed.connect(self._on_target_settings_changed)
+            editor.models_changed.connect(self.update_start_availability)
         self.training.load_models.clicked.connect(self.load_saved_models)
         self.training.refresh_images.clicked.connect(self.refresh_dataset)
         self._describe_features()
@@ -1011,7 +1335,10 @@ class MainWindow(QMainWindow):
         self.image_timer = self._precise_timer(self.end_image)
         self.training.start.setEnabled(False)
         self.training.status.setText("Waiting for live EEG samples before a session can start.")
-        self.setStyleSheet("QMainWindow,QWidget{background:#182335;color:#e8effc;font-size:13px} QLabel#heading{font-size:24px;font-weight:700;margin:4px 0 10px} QLabel#metric{font-size:18px;font-weight:600;color:#6dd7bf} QLabel#warning{color:#ffb86b} QLabel#status{font-size:16px;font-weight:600} QPushButton{background:#29466c;border-radius:7px;padding:8px 12px} QPushButton:hover{background:#376293} QPushButton:disabled{background:#354155;color:#8d9aaf} QSpinBox,QDoubleSpinBox,QComboBox{background:#25364e;padding:5px;border:1px solid #627795} QTabBar::tab{padding:9px 17px}")
+        app = QApplication.instance()
+        if app is not None:
+            app.setStyleSheet(STYLE)   # shared by all three windows
+        self._update_neutral_status()
 
     def _precise_timer(self, callback):
         timer = QTimer(self)
@@ -1022,20 +1349,85 @@ class MainWindow(QMainWindow):
 
     @property
     def _settings_widgets(self) -> list[QWidget]:
-        t = self.training
-        return [t.participant, t.serial, t.count, t.persistent, t.stop_key, t.oscar, t.warmup, t.warmup_seconds,
-                t.image_seconds, t.fixation_min, t.fixation_max, t.evaluation, t.configuration,
-                t.session, t.load_models, t.refresh_images, t.feedback_classifier, t.practice,
-                t.stop_rule, t.stop_rule_threshold,
-                *t.electrode_boxes, *t.train_boxes.values()]
+        return self.training.input_widgets()
+
+    # ------------------------------------------------------------------ neutral control images
+    def _load_neutral_images(self) -> list[Path]:
+        folder = self.config.neutral_dir
+        if folder is None or not folder.is_dir():
+            return []
+        return sorted(p for p in folder.iterdir() if p.is_file() and p.suffix.lower() in IMAGE_SUFFIXES)
+
+    def _update_neutral_status(self):
+        folder = self.config.neutral_dir
+        if folder is None:
+            where = "—"
+        else:
+            try:
+                where = folder.relative_to(self.config.data_dir.parent).as_posix()
+            except ValueError:
+                where = str(folder)
+        text = (f"{len(self.neutral_images)} images in {where}, shuffled and repeated as needed"
+                if self.neutral_images else f"No images found in {where}")
+        # Fillers that are also trial stimuli would be seen outside trials (extra, unlabelled exposures).
+        dataset = getattr(self, "dataset", None)
+        trial_names = {i.path.name for i in dataset.images} if dataset is not None else set()
+        shared = sorted({p.name for p in self.neutral_images} & trial_names)
+        if shared:
+            text += (f"\n⚠ {len(shared)} of them are also trial images (e.g. {shared[0]}). Prefer the fixation "
+                     "cross, or point CONFIG['neutral_images'] to a folder without trial images.")
+        self.training.neutral_status.setText(text)
+
+    def _next_neutral(self) -> Path:
+        """Shuffled cycle through the neutral images; repeats are expected (control condition)."""
+        if not self.neutral_queue:
+            last = self.pre_stimulus.get("image") if self.pre_stimulus else None
+            self.neutral_queue = random.sample(self.neutral_images, len(self.neutral_images))
+            if len(self.neutral_queue) > 1 and self.neutral_queue[-1].name == last:
+                self.neutral_queue.insert(0, self.neutral_queue.pop())
+        return self.neutral_queue.pop()
+
+    def _on_between_changed(self):
+        self.training.update_between_rows()
+        self.update_timing_note()
+        self.update_start_availability()
 
     # ------------------------------------------------------------------ EEG source
-    def _make_device(self):
-        """Create the Unicorn EEG source."""
-        self.device = DeviceManager(self.config.eeg, self.training.serial.text().strip() or None)
+    def _make_device(self, device=None):
+        """Create the Unicorn EEG source, or adopt a running one handed over by another experiment."""
+        eeg = self.config.eeg
+        if device is not None and (device.eeg.fs != eeg.fs
+                                   or tuple(device.eeg.device_channels) != eeg.device_channels):
+            device.close()
+            device = None
+        if device is None:
+            self.device = DeviceManager(eeg, self.training.serial.text().strip() or None)
+        else:
+            self.device = device
+            self.training.serial.setText(device.serial or "")
+            self.training.oscar.setChecked(device.oscar)
         self.device.status_changed.connect(self.training.device_status.setText)
         self.device.connected_changed.connect(self.on_connection)
-        self.training.device_status.setText("Checking for Unicorn…")
+        self.training.device_status.setText("Unicorn connected (handed over)." if self.device.connected
+                                            else "Checking for Unicorn…")
+
+    def release_device(self):
+        """Give the running EEG connection to another experiment's window (not closed with this one)."""
+        self.device.status_changed.disconnect(self.training.device_status.setText)
+        self.device.connected_changed.disconnect(self.on_connection)
+        self.handed_over = True
+        return self.device
+
+    def switch_to_taste(self):
+        """Open the sweet-vs-salty taste experiment in place of these windows."""
+        if self.active or self.finishing:
+            return
+        if not self.ready_for_new_run and QMessageBox.question(
+                self, "Switch experiment", "The last run is not saved. Discard it and switch?"
+        ) != QMessageBox.StandardButton.Yes:
+            return
+        from .taste_gui import open_taste_experiment
+        return open_taste_experiment(self)
 
     @property
     def _source_name(self) -> str:
@@ -1067,6 +1459,8 @@ class MainWindow(QMainWindow):
         if self.active or self.finishing:
             return
         self.dataset = self.load_dataset()
+        self.neutral_images = self._load_neutral_images()
+        self._update_neutral_status()
         self._refresh_evaluation_options()
 
     def _image_files(self, groups: dict[str, list[StimulusImage]]) -> set[str]:
@@ -1131,58 +1525,98 @@ class MainWindow(QMainWindow):
         self.update_start_availability()
 
     # ------------------------------------------------------------------ feature configuration
+    def _current_profile(self):
+        """The selected preset with the per-target settings from the GUI (electrodes, bands, features, window)."""
+        preset = self.config.profile(self.profile_number)
+        specs = self.training.target_specs()
+        # Fields the GUI does not edit (e.g. a per-target bandpass) are kept from the preset.
+        return replace(preset, targets=tuple(
+            (name, replace(spec, electrodes=specs[name].electrodes, bands=specs[name].bands,
+                           features=specs[name].features, window_ms=specs[name].window_ms))
+            for name, spec in preset.targets))
+
+    def _profile_customized(self) -> bool:
+        preset = self.config.profile(self.profile_number)
+        current = self.training.target_specs()
+        for name, spec in preset.targets:
+            mine = current[name]
+            electrodes = set(self.config.eeg.electrodes if spec.electrodes is None else spec.electrodes)
+            if (electrodes != set(mine.electrodes) or set(spec.bands) != set(mine.bands)
+                    or set(spec.features) != set(mine.features) or spec.window_ms != mine.window_ms):
+                return True
+        return False
+
     def _rebuild_features(self):
-        """Per-target extractors for the selected configuration and model electrodes."""
-        self.target_features = TargetFeatures(self.config.eeg, self.config.profile(self.profile_number),
-                                              self.model_channel_indices)
-        image_ms = round(self.training.image_seconds.value() * 1000)
+        """Per-target extractors for the current per-target settings."""
+        self.target_features = TargetFeatures(self.config.eeg, self._current_profile())
         minimum = self.target_features.min_image_duration_ms / 1000
         if self.training.image_seconds.value() < minimum:
             self.training.image_seconds.setValue(minimum)
-            image_ms = round(minimum * 1000)
-        self.epoch_spec = self.target_features.epoch_spec(image_ms)
+        self.epoch_spec = self.target_features.epoch_spec(round(self.training.image_seconds.value() * 1000))
         had_models = bool(self.eval_models)
         self.eval_models = {}
         self.eval_info = {}
         self.training.feedback_classifier.clear()
         self.training.models_status.setText(
-            f"Configuration {self.profile_number}: previous models no longer match and were unloaded. "
-            "Start a Training session, or load models saved with this configuration."
+            "Feature settings changed: previously loaded models no longer match and were unloaded. "
+            "Train again, or load models saved with these settings."
             if had_models else "No trained models yet.")
         self._describe_features()
         self.update_timing_note()
         self._refresh_validation_availability()
         self.update_start_availability()
 
+    @staticmethod
+    def _window_text(window_ms):
+        return "whole image" if window_ms is None else f"0–{window_ms} ms"
+
     def _describe_features(self):
-        names = ", ".join(self.config.eeg.electrodes[index] for index in self.model_channel_indices)
-        lines = [f"Model electrodes: {names}. Diagnostics show all eight."]
-        for target, spec in self.target_features.describe().items():
-            lines.append(f"{target}: {spec['n_features']} features · {', '.join(spec['electrodes'])} · "
-                         f"{', '.join(spec['bands'])} · {', '.join(spec['features'])}")
-        for target, problem in self.target_features.problems.items():
-            lines.append(f"{target}: unavailable ({problem}) — select its electrodes or another configuration.")
-        self.training.electrode_status.setText("\n".join(lines))
+        lines = []
+        described = self.target_features.describe()
+        for name, editor in self.training.target_editors.items():
+            if name in self.target_features.problems:
+                text = f"⚠ Not available: {self.target_features.problems[name]}."
+                editor.summary.setText(text)
+                lines.append(f"<b>{name}</b>: {text}")
+                continue
+            spec = described[name]
+            dropped = set(editor.spec().features) - set(spec["features"])
+            skipped = ", ".join(FEATURE_LABELS.get(f, (f,))[0] for f in sorted(dropped))
+            note = f"⚠ Skipped {skipped}: needs other electrodes or bands." if dropped else ""
+            text = (f"{spec['n_features']} features · {', '.join(spec['electrodes'])} · {', '.join(spec['bands'])} · "
+                    f"{self._window_text(spec['window_ms'])}" + (f" · {note}" if note else ""))
+            editor.summary.setText(note)
+            lines.append(f"<b>{name}</b>: {text}")
+        preset = self.config.profile(self.profile_number)
+        if self._profile_customized():
+            lines.append(f"Based on preset {preset.number}, edited.")
+        self.training.electrode_status.setText("<br>".join(lines))
+        eeg = self.config.eeg
+        b0, b1 = preset.baseline_ms
+        self.training.shared_note.setText(
+            f"Shared by both targets: baseline {b0} to {b1} ms · bandpass {eeg.bandpass_hz[0]:g}–{eeg.bandpass_hz[1]:g} Hz"
+            + (f" · notch {eeg.notch_hz:g} Hz" if eeg.notch_hz else "")
+            + (f" · epochs rejected above ±{eeg.artifact_max_abs_uv:g} µV" if eeg.artifact_max_abs_uv else "")
+            + f" · {'common average' if eeg.reference == 'car' else 'device'} reference.")
 
     def _on_configuration_changed(self):
         if self.active or self.finishing:
             return
+        if self.training.configuration.currentData() == TASTE_EXPERIMENT:
+            # Keep showing the current preset here; the taste experiment opens its own windows.
+            combo = self.training.configuration
+            combo.blockSignals(True)
+            combo.setCurrentIndex(combo.findData(self.profile_number))
+            combo.blockSignals(False)
+            QTimer.singleShot(0, self.switch_to_taste)
+            return
         self.profile_number = self.training.configuration.currentData()
+        self.training.load_profile(self.config.profile(self.profile_number))
         self._rebuild_features()
 
-    def _on_electrodes_changed(self):
+    def _on_target_settings_changed(self):
         if self.active or self.finishing:
             return
-        positions = self.training.selected_electrode_positions()
-        if not positions:
-            self.training.electrode_status.setText("Select at least one electrode for the model.")
-            self.update_start_availability()
-            return
-        if positions == self.model_channel_indices:
-            self._describe_features()
-            self.update_start_availability()
-            return
-        self.model_channel_indices = positions
         self._rebuild_features()
 
     def _usable_pairs(self, pairs: list[tuple[str, str]]) -> list[tuple[str, str]]:
@@ -1192,12 +1626,38 @@ class MainWindow(QMainWindow):
     def _features_ready(self, pairs: list[tuple[str, str]]) -> bool:
         return bool(self._usable_pairs(pairs))
 
+    def _between_seconds(self, session: str | None = None) -> tuple[float, float]:
+        """(min, max) duration of the gap before each image in ``session``."""
+        session = session or self.session_type
+        if self.training.between_mode() == BETWEEN_NEUTRAL:
+            value = self.training.neutral_seconds.value()
+            return value, value
+        if session == SESSION_TEST:
+            return self.config.test_rest_s, self.config.test_rest_s
+        if session == SESSION_CALIBRATION:
+            rest = float(self.config.calibration["rest_s"])
+            return rest, rest
+        return self.training.fixation_min.value(), self.training.fixation_max.value()
+
     def update_timing_note(self):
         try:
             spec = self.target_features.epoch_spec(round(self.training.image_seconds.value() * 1000))
         except ValueError:
             return
-        self.presentation.set_timing(self.training.fixation_min.value(), self.training.fixation_max.value(), spec)
+        lo, hi = self._between_seconds(SESSION_TRAINING)
+        between = (f"neutral image {lo:g} s" if self.training.between_mode() == BETWEEN_NEUTRAL
+                   else f"fixation {lo:g}–{hi:g} s")
+        windows = {t: self.target_features.target_spec(t, spec).end_ms for t in self.target_features.targets}
+        epoch = " · ".join(f"{t} {spec.start_ms} to +{end} ms" for t, end in windows.items()) or \
+            f"{spec.start_ms} to +{spec.end_ms} ms"
+        text = (f"Between images: {between}   ·   Image: {spec.image_duration_ms / 1000:g} s   ·   "
+                f"EEG epoch: {epoch} (baseline to {spec.baseline_end_ms} ms)")
+        if not self.training.persistent.isChecked():
+            per_trial = (lo + hi) / 2 + spec.image_duration_ms / 1000
+            minutes = round(self.training.count.value() * per_trial / 60)
+            duration = f"{minutes // 60} h {minutes % 60:02d} min" if minutes >= 60 else f"{max(1, minutes)} min"
+            text += f"   ·   {self.training.count.value()} trials ≈ {duration}"
+        self.presentation.set_timing(text)
 
     def show_windows(self, available: QRect | None = None):
         """Open all three movable windows in adjacent slices of one screen."""
@@ -1233,7 +1693,7 @@ class MainWindow(QMainWindow):
         self.update_start_availability()
 
     def configure_device_from_controls(self):
-        if self.active or self.finishing:
+        if self.active or self.finishing or self.handed_over:
             return
         oscar = self.training.oscar.isChecked()
         serial = self.training.serial.text().strip() or None
@@ -1261,20 +1721,21 @@ class MainWindow(QMainWindow):
             valid = bool(self.eval_models)
         else:
             valid = True
-        electrodes = bool(self.training.selected_electrode_positions())
+        neutral = (session == SESSION_RESTING or self.training.between_mode() != BETWEEN_NEUTRAL
+                   or bool(self.neutral_images))
         stream = self.device.stream_ready()
-        enabled = self.ready_for_new_run and not self.active and not self.finishing and valid and electrodes and stream
+        enabled = self.ready_for_new_run and not self.active and not self.finishing and valid and neutral and stream
         self.training.start.setEnabled(enabled)
         self.training.start_hint.setText("" if enabled or self.active or self.finishing
                                          else "Start disabled: " + self._start_blocker(session, pairs, valid,
-                                                                                       electrodes, stream))
+                                                                                       neutral, stream))
 
-    def _start_blocker(self, session, pairs, valid, electrodes, stream) -> str:
+    def _start_blocker(self, session, pairs, valid, neutral, stream) -> str:
         """Plain-language reason why the Start button is disabled."""
         if not self.ready_for_new_run:
             return "save or discard the previous run first."
-        if not electrodes:
-            return "select at least one model electrode."
+        if not neutral:
+            return "no neutral images found; add images to the neutral folder or choose the fixation cross."
         if not stream:
             return "waiting for a live EEG stream from the headset."
         if valid:
@@ -1284,8 +1745,8 @@ class MainWindow(QMainWindow):
                 return "tick at least one target/model pair."
             if not self._features_ready(pairs):
                 missing = ", ".join(sorted({t for t, _ in pairs}))
-                return (f"configuration {self.profile_number} has no features for {missing} with the selected "
-                        "electrodes. Tick that target's electrodes or another target.")
+                return (f"no usable features for {missing}: open its tab and tick electrodes, bands and "
+                        "feature families (see the summary there).")
             if session == SESSION_TRAINING:
                 return "no valid evaluation mode for this trial count (see the evaluation note)."
             return "no usable image dataset."
@@ -1315,11 +1776,10 @@ class MainWindow(QMainWindow):
             self.training.persistent.setEnabled(session == SESSION_TRAINING)
             self.training.evaluation.setEnabled(session == SESSION_TRAINING)
             self.training.practice.setEnabled(session == SESSION_TEST)
-            for box in self.training.electrode_boxes:
-                box.setEnabled(learning)
+            for editor in self.training.target_editors.values():
+                editor.set_editable(learning)
             self.training.configuration.setEnabled(learning)
-            for box in self.training.train_boxes.values():
-                box.setEnabled(learning)
+            self.training.apply_preset.setEnabled(learning)
             if learning:
                 self.training.update_model_limit()
         self.presentation.plane.setVisible(session in (SESSION_VALIDATION, SESSION_TEST, SESSION_CALIBRATION))
@@ -1342,8 +1802,9 @@ class MainWindow(QMainWindow):
         duration = info.get("image_duration_s")
         kind = ("sustained-state windows of %g s" % self.eval_info["window_s"]
                 if self.eval_info["kind"] == "state" else f"image {duration:g} s" if duration else "")
+        edited = ", edited" if self._profile_customized() else ""
         self.training.models_status.setText(
-            f"{len(models)} model(s) from {source} · configuration {self.profile_number}" + (f" · {kind}" if kind else ""))
+            f"{len(models)} model(s) from {source} · preset {self.profile_number}{edited}" + (f" · {kind}" if kind else ""))
         self._refresh_validation_availability()
         self.update_start_availability()
 
@@ -1356,18 +1817,28 @@ class MainWindow(QMainWindow):
             models, manifest = load_models(Path(path))
         except (OSError, ValueError, KeyError) as exc:
             QMessageBox.warning(self, "Load models", str(exc)); return
-        configuration = manifest.get("configuration")
-        if configuration is not None and configuration != self.profile_number:
-            QMessageBox.warning(self, "Load models", f"These models were trained with configuration {configuration}. "
-                                "Select that configuration (and the same electrodes) first.")
-            return
         saved_names = manifest.get("feature_names_by_target") or {}
+        saved_specs = manifest.get("target_features") or {}
         current = self.target_features.names
-        mismatched = [t for t, _ in models if tuple(saved_names.get(t, ())) != tuple(current.get(t, ()))]
+        current_specs = self.target_features.describe()
+        def differs(target: str, key: str) -> bool:
+            """A per-target setting recorded in the manifest that the current settings do not reproduce."""
+            saved = saved_specs.get(target, {})
+            if key not in saved:
+                return False   # older manifests do not record it
+            mine = current_specs.get(target, {}).get(key)
+            as_list = lambda v: list(v) if isinstance(v, (list, tuple)) else v
+            return as_list(saved[key]) != as_list(mine)
+
+        mismatched = sorted({t for t, _ in models
+                             if tuple(saved_names.get(t, ())) != tuple(current.get(t, ()))
+                             or differs(t, "window_ms") or differs(t, "bandpass_hz")})
         if mismatched:
+            preset = manifest.get("configuration")
             QMessageBox.warning(self, "Load models", "These models were trained on different features than the "
-                                f"current configuration produces ({', '.join(sorted(set(mismatched)))}). "
-                                "Select the same configuration and electrodes, or retrain.")
+                                f"current settings produce ({', '.join(mismatched)}). Choose the same preset"
+                                + (f" ({preset})" if preset is not None else "")
+                                + " and per-target electrodes, bands, features, window and filter, or retrain.")
             return
         self._set_eval_models(models, {"image_duration_s": manifest.get("image_duration_s"),
                                        "manifest": Path(path).name,
@@ -1438,14 +1909,20 @@ class MainWindow(QMainWindow):
         if session == SESSION_VALIDATION and not self._validation_eligible():
             self.training.status.setText("Validation needs models trained without the held-out images.")
             return
-        if not self.training.selected_electrode_positions():
-            self.training.status.setText("Select at least one model electrode.")
-            return
         fixation_min = self.training.fixation_min.value()
         fixation_max = self.training.fixation_max.value()
-        if fixation_min > fixation_max:
+        between = self.training.between_mode()
+        if between == BETWEEN_FIXATION and fixation_min > fixation_max:
             QMessageBox.warning(self, "Fixation timing", "Fixation minimum must be at most the maximum.")
             return
+        if between == BETWEEN_NEUTRAL and session != SESSION_RESTING:
+            self.neutral_images = self._load_neutral_images()
+            self._update_neutral_status()
+            if not self.neutral_images:
+                QMessageBox.warning(self, "Neutral images", "No neutral images found. Add images to the neutral "
+                                    "folder or choose the fixation cross.")
+                return
+            self.neutral_queue = []
         model_pairs = self.training.selected_model_pairs()
         if learning:
             if not model_pairs:
@@ -1454,8 +1931,8 @@ class MainWindow(QMainWindow):
             usable = self._usable_pairs(model_pairs)
             if not usable:
                 missing = sorted({t for t, _ in model_pairs})
-                QMessageBox.warning(self, "Features", f"Configuration {self.profile_number} has no features for "
-                                    f"{', '.join(missing)} with the selected electrodes.")
+                QMessageBox.warning(self, "Features", f"No usable features for {', '.join(missing)} with the "
+                                    "current per-target settings.")
                 return
             # Train what this configuration supports; skip targets whose electrodes are not selected.
             model_pairs = usable
@@ -1575,7 +2052,9 @@ class MainWindow(QMainWindow):
         evaluation_mode = (self.training.evaluation.currentData() if learning
                            else self.eval_info.get("evaluation_mode"))
         profile = self.config.profile(self.profile_number)
-        model_eeg = self.config.eeg.select_electrodes(self.model_channel_indices)
+        model_eeg = self.config.eeg.select_electrodes(self.target_features.union_channels
+                                                      or tuple(range(len(eeg.electrodes))))
+        self.pre_stimulus = None
         self.run_metadata = {"session": session,
                              "started_at": datetime.now().astimezone().isoformat(),
                              "participant_id": self.training.participant.text().strip() or "unnamed",
@@ -1588,6 +2067,7 @@ class MainWindow(QMainWindow):
                              "practice": session == SESSION_TEST and self.training.practice.isChecked(),
                              "evaluation_mode": evaluation_mode,
                              "configuration": self.profile_number, "configuration_name": profile.name,
+                             "configuration_edited": self._profile_customized(),
                              "target_features": self.target_features.describe(),
                              "feature_names_by_target": {t: list(n) for t, n in self.target_features.names.items()},
                              "model_kind": "state" if session == SESSION_CALIBRATION else "epoch",
@@ -1596,11 +2076,15 @@ class MainWindow(QMainWindow):
                              "oscar_enabled": self.training.oscar.isChecked(),
                              "image_duration_s": self.epoch_spec.image_duration_ms / 1000,
                              "fixation_min_s": fixation_min, "fixation_max_s": fixation_max,
+                             "between_images": between,
+                             "neutral_s": self.training.neutral_seconds.value() if between == BETWEEN_NEUTRAL else None,
+                             "neutral_images": ([p.name for p in self.neutral_images]
+                                                if between == BETWEEN_NEUTRAL else []),
                              "test_trial_s": self.config.test_trial_s if session == SESSION_TEST else None,
                              "test_rest_s": self.config.test_rest_s if session == SESSION_TEST else None,
                              "epoch_start_ms": self.epoch_spec.start_ms, "epoch_end_ms": self.epoch_spec.end_ms,
                              "baseline_ms": [self.epoch_spec.start_ms, self.epoch_spec.baseline_end_ms],
-                             "analysis_window_ms": profile.window_ms,
+                             "analysis_window_ms": {t: w for t, w in self.target_features.windows.items()},
                              "epoch_sample_count": self.epoch_spec.n_samples,
                              "psd_method": eeg.psd_method, "reference": eeg.reference,
                              "artifact_max_abs_uv": eeg.artifact_max_abs_uv,
@@ -1664,15 +2148,21 @@ class MainWindow(QMainWindow):
         self.next_trial = self.plan.next() if self.plan else None
         if self.next_trial is None:
             self.stop_run(); return
-        self.presentation.stimulus.fixation()
-        self.training.status.setText(f"Fixation before trial {self.shown + 1}")
-        if self.running_session == SESSION_TEST:
-            delay = round(self.config.test_rest_s * 1000)
-        elif self.running_session == SESSION_CALIBRATION:
-            delay = round(self.config.calibration["rest_s"] * 1000)
+        lo, hi = self._between_seconds(self.running_session)
+        delay = random.randint(round(lo * 1000), round(hi * 1000))
+        if self.training.between_mode() == BETWEEN_NEUTRAL:
+            path = self._next_neutral()
+            try:
+                self.presentation.stimulus.neutral(path)
+            except ValueError as exc:
+                self.stop_run(f"{exc}.")
+                return
+            self.pre_stimulus = {"kind": "neutral", "image": path.name, "duration_s": delay / 1000}
+            self.training.status.setText(f"Neutral image before trial {self.shown + 1}: {path.name}")
         else:
-            delay = random.randint(round(self.training.fixation_min.value() * 1000),
-                                   round(self.training.fixation_max.value() * 1000))
+            self.presentation.stimulus.fixation()
+            self.pre_stimulus = {"kind": "fixation", "duration_s": delay / 1000}
+            self.training.status.setText(f"Fixation before trial {self.shown + 1}")
         self.fixation_timer.start(delay)
 
     def show_trial(self):
@@ -1710,7 +2200,8 @@ class MainWindow(QMainWindow):
                  "onset_s_from_run_start": round(stamp - self.run_start_clock, 6),
                  "marker_code": marker_code,
                  "paint_to_marker_ms": round(marker_delay_ms, 3),
-                 "eeg": "continuous" if session == SESSION_TEST else "pending"}
+                 "eeg": "continuous" if session == SESSION_TEST else "pending",
+                 "before_image": self.pre_stimulus}
         if session != SESSION_TRAINING:
             self.current_target = self._target_point(dataset, item)
             self.current_trial = self.shown
@@ -2244,7 +2735,8 @@ class MainWindow(QMainWindow):
         self.warmup_timer.stop()
         self.fixation_timer.stop()
         self.image_timer.stop()
-        self.device.close()
+        if not self.handed_over:
+            self.device.close()
         self.training_executor.shutdown(wait=False, cancel_futures=True)
         self.report_executor.shutdown(wait=False, cancel_futures=True)
         self.presentation_window.close()

@@ -18,6 +18,7 @@ from typing import Callable
 import numpy as np
 from sklearn.base import BaseEstimator, ClassifierMixin
 from sklearn.calibration import CalibratedClassifierCV
+from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.feature_selection import SelectKBest, f_classif
 from sklearn.linear_model import LogisticRegression, RidgeCV
@@ -180,6 +181,12 @@ register_classifier("forest", "Random forest (shallow)",
                         n_estimators=48, max_depth=4, min_samples_leaf=4,
                         max_features="sqrt", class_weight="balanced_subsample",
                         random_state=41, n_jobs=1))
+# Shrinkage LDA: the class covariance is shrunk towards a scaled identity with the
+# analytic Ledoit-Wolf intensity, so it stays well conditioned when there are
+# only a few trials per feature. It is the standard small-sample BCI classifier
+# (Blankertz et al. 2011, NeuroImage 56:814). Equal priors aim at balanced accuracy.
+register_classifier("lda_shrinkage", "Shrinkage LDA (Ledoit-Wolf, small samples)",
+                    lambda: LinearDiscriminantAnalysis(solver="lsqr", shrinkage="auto", priors=[.5, .5]))
 register_classifier("logreg_select", "LogReg + feature selection (nested CV)",
                     lambda: SelectKLogistic(), min_per_class=3)
 register_classifier("ridge", "Ridge regression (continuous V-A)",

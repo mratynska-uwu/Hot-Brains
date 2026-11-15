@@ -15,6 +15,7 @@ from PySide6.QtGui import QImage
 from PySide6.QtWidgets import QApplication
 
 from hotbrain.dataset import StimulusImage
+from conftest import classic_config
 from hotbrain.config import CONFIG
 from hotbrain.gui import MainWindow, PendingEpoch
 from hotbrain.training import MultiTrainer
@@ -116,15 +117,17 @@ def test_validation_uses_frozen_models_when_no_training_pairs_are_selected(tmp_p
             assert QImage(12, 12, QImage.Format.Format_RGB32).save(str(folder / image))
             rows.append(f"{image},{valence},{index + 1}")
         folder.with_suffix(".csv").write_text("\n".join(rows), encoding="utf-8")
-    config = copy.deepcopy(CONFIG)
+    config = classic_config()   # synthetic CSVs: valence/arousal only
     config["datasets"] = ["happy", "sad"]
     config["balance_by"] = "valence"
     config["split"]["validation_fraction"] = 0.5
     app = QApplication.instance() or QApplication([])
     window = MainWindow(tmp_path, config)
     try:
-        for index, box in enumerate(window.training.electrode_boxes):
-            box.setChecked(index in (0, 2, 7))
+        for editor in window.training.target_editors.values():
+            for index, box in enumerate(editor.electrode_boxes):
+                box.setChecked(index in (0, 2, 7))
+        window.training.image_seconds.setValue(3.0)   # the fixture models were trained on 3 s images
         window.training.evaluation.setCurrentIndex(1)
         window._set_eval_models({("valence", "logreg"): FixedModel()},
                                 {"image_duration_s": 3.0, "evaluation_mode": "split",

@@ -8,9 +8,11 @@ import pytest
 from hotbrain import classifiers
 from hotbrain.config import CONFIG, AppConfig, EEGSettings
 from hotbrain.dataset import load_dataset, rethreshold
-from hotbrain.features import ArtifactError, FeatureExtractor, TargetFeatures
+from hotbrain.features import ArtifactError, FeatureExtractor, TargetFeatures, make_filter
 from hotbrain.sessions import split_dataset
 from hotbrain.training import MultiTrainer
+
+from conftest import classic_config
 
 ROOT = Path(__file__).resolve().parents[1]
 APP = AppConfig.from_dict(CONFIG, ROOT)
@@ -90,10 +92,11 @@ def test_artifact_threshold_and_common_average_reference():
 
 
 def test_middle_tercile_is_excluded_and_threshold_comes_from_training_split():
-    dataset = load_dataset(APP)
-    train, _ = split_dataset(dataset, APP.validation_fraction, APP.split_seed)
+    app = AppConfig.from_dict(classic_config(), ROOT)      # median-split arousal without conditions
+    dataset = load_dataset(app)
+    train, _ = split_dataset(dataset, app.validation_fraction, app.split_seed)
     train_images = [i for items in train.values() for i in items]
-    relabelled = rethreshold(APP, dataset, train_images)
+    relabelled = rethreshold(app, dataset, train_images)
     assert relabelled.threshold_source == "training split"
     values = sorted(i.values["arousal"] for i in train_images)
     assert relabelled.thresholds["arousal"] == pytest.approx(float(np.median(values)))
@@ -141,3 +144,65 @@ def test_trainer_skips_excluded_labels_and_batches_do_not_predict_each_other():
     assert len(batch[("valence", "logreg")]) == 3
     assert trainer.models[("valence", "logreg")].model is not model_before   # refit once after the block
     assert trainer.models[("valence", "logreg")].rolling_balanced_accuracy() is not None
+
+
+def test_configuration_3_small_sample_layout():
+    profile = APP.profile(3)
+    features = TargetFeatures(APP.eeg, profile)
+    assert not features.problems
+    spec = features.epoch_spec(3000)
+    assert (spec.start_ms, spec.end_ms, spec.baseline_end_ms) == (-500, 3000, -200)
+    names = features.names
+    # Few, spatially averaged features: ERP region means x 4 windows + theta/alpha.
+    assert len(names["arousal"]) == 3 * 4 + 3 * 2       # erp + region_band_power
+    assert len(names["valence"]) == 3 * 4 + 2 * 2       # erp + asymmetry (C4-C3, PO8-PO7)
+    for target in ("valence", "arousal"):
+        assert "Fz" not in features.describe()[target]["electrodes"]      # blink-prone
+        assert not any("gamma" in n or "beta" in n for n in names[target])  # facial EMG
+        assert profile.target(target).bandpass_hz == (0.1, 30.0)
+        assert features.extractors[target].eeg.bandpass_hz == (0.1, 30.0)
+    assert {n.split(" ERP ")[1] for n in names["arousal"] if " ERP " in n} == {
+        "100-200 ms", "200-300 ms", "300-450 ms", "450-800 ms"}
+    # Artifact rejection keeps the global 1-48 Hz filter.
+    assert np.allclose(features.sos, make_filter(APP.eeg))
+    vectors = features.extract(RNG.normal(0, 5, (spec.n_samples, 8)), spec)
+    assert {t: len(v) for t, v in vectors.items()} == {"arousal": 18, "valence": 16}
+    assert all(np.isfinite(v).all() for v in vectors.values())
+
+
+def test_configuration_3_high_pass_keeps_the_late_positive_potential():
+    """A 4 µV LPP (peak 600 ms) at Cz/Pz survives the 0.1 Hz high-pass; 1 Hz would leave < 1 µV."""
+    features = TargetFeatures(APP.eeg, APP.profile(3))
+    spec = features.epoch_spec(3000)
+    t = (np.arange(spec.n_samples) + round(spec.start_ms * APP.eeg.fs / 1000)) / APP.eeg.fs
+    epoch = RNG.normal(0, .2, (spec.n_samples, 8))
+    for name in ("Cz", "Pz"):
+        epoch[:, APP.eeg.electrodes.index(name)] += 4 * np.exp(-.5 * ((t - .6) / .15) ** 2)
+    names = features.names["arousal"]
+    lpp = features.extract(epoch, spec)["arousal"][names.index("parietal ERP 450-800 ms")]
+    assert lpp > 2.5
+    one_hz = copy.deepcopy(CONFIG)
+    one_hz["profiles"][3]["bandpass_hz"] = [1, 30]
+    weak = TargetFeatures(APP.eeg, AppConfig.from_dict(one_hz, ROOT).profile(3))
+    assert weak.extract(epoch, spec)["arousal"][names.index("parietal ERP 450-800 ms")] < 1.0
+
+
+def test_profile_bandpass_is_validated():
+    bad = copy.deepcopy(CONFIG)
+    bad["profiles"][3]["targets"]["arousal"]["bandpass_hz"] = [0, 30]
+    with pytest.raises(ValueError, match="bandpass_hz"):
+        AppConfig.from_dict(bad, ROOT)
+    # Profiles without it use the global bandpass.
+    assert APP.profile(1).target("valence").bandpass_hz is None
+
+
+def test_shrinkage_lda_handles_fewer_trials_than_features():
+    x = RNG.normal(size=(12, 18))                 # 6 trials per class, 18 features (n < p)
+    y = np.repeat([0, 1], 6)
+    x[y == 1, :3] += 1.0
+    model = classifiers.build("lda_shrinkage").fit(x, y)
+    lda = model.steps[-1][1]
+    assert 0 < lda.covariance_.shape[0] == 18 and np.all(np.linalg.eigvalsh(lda.covariance_) > 0)
+    assert classifiers.coefficients(model).shape == (18,)
+    assert 0 <= classifiers.probability_class1(model, x[0]) <= 1
+    assert not classifiers.needs_calibration("lda_shrinkage")

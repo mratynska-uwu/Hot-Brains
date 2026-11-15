@@ -22,7 +22,7 @@ def dataset():
 
 def test_split_is_stratified_reproducible_and_disjoint(dataset):
     train, validation = split_dataset(dataset, 0.2, 42)
-    for group, items in dataset.groups.items():   # stratified: 20% of each valence class
+    for group, items in dataset.groups.items():   # stratified: 20% of each stimulus condition
         assert len(validation[group]) == round(len(items) * 0.2)
         assert len(train[group]) == len(items) - len(validation[group])
     for group in dataset.groups:
@@ -34,7 +34,7 @@ def test_split_is_stratified_reproducible_and_disjoint(dataset):
     assert {g: [i.path.name for i in v] for g, v in again.items()} == \
         {g: [i.path.name for i in v] for g, v in validation.items()}
     other = split_dataset(dataset, 0.2, 7)[1]
-    assert [i.path.name for i in other["valence=positive"]] != [i.path.name for i in validation["valence=positive"]]
+    assert [i.path.name for i in other["positive"]] != [i.path.name for i in validation["positive"]]
 
 
 def test_once_plan_shows_each_image_once(dataset):
@@ -49,7 +49,7 @@ def test_normalized_targets_span_minus_one_to_one(dataset):
     values = [dataset.normalized("valence", i.values["valence"]) for i in dataset.images]
     assert min(values) == -1.0 or max(values) == 1.0
     assert all(-1 <= v <= 1 for v in values)
-    positive = dataset.groups["valence=positive"][0]
+    positive = dataset.groups["positive"][0]
     assert dataset.normalized("valence", positive.values["valence"]) > 0
 
 

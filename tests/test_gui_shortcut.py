@@ -15,6 +15,7 @@ from PySide6.QtWidgets import QApplication
 
 import hotbrain.gui as gui
 from hotbrain.acquisition import SampleRing
+from conftest import classic_config
 from hotbrain.config import CONFIG
 from hotbrain.training import MultiTrainer
 
@@ -75,7 +76,7 @@ def test_chosen_key_stops_from_presentation_window(tmp_path: Path, monkeypatch):
             assert QImage(12, 12, QImage.Format.Format_RGB32).save(str(folder / f"sample{i}.png"))
             lines.append(f"sample{i}.png,{3 if positive else -3},{value}")
         folder.with_suffix(".csv").write_text("\n".join(lines), encoding="utf-8")
-    config = copy.deepcopy(CONFIG)
+    config = classic_config()   # synthetic CSVs: valence/arousal only
     config["datasets"] = ["set/happy", "set/sad"]
 
     app = QApplication.instance() or QApplication([])
@@ -117,14 +118,16 @@ def test_chosen_key_stops_from_presentation_window(tmp_path: Path, monkeypatch):
         assert window.presentation.stimulus.state == "idle"
         assert not window.features.samples
         assert window.training.image_seconds.value() == 3.0
+        assert window.training.between_mode() == gui.BETWEEN_FIXATION
         assert all(timer.timerType() == Qt.TimerType.PreciseTimer for timer in
                    (window.warmup_timer, window.fixation_timer, window.image_timer))
-        assert window.training.fixation_min.value() == 2.0
-        assert window.training.fixation_max.value() == 3.0
-        assert "+2700 ms" in window.presentation.note.text()
+        assert window.training.fixation_min.value() == 1.5
+        assert window.training.fixation_max.value() == 2.0
+        assert "+2700 ms" in window.presentation.note.text()   # 3 s image, configuration 1: until 300 ms before offset
         assert window.training.selected_model_pairs() == [("valence", "svm")]
-        for index, box in enumerate(window.training.electrode_boxes):
-            box.setChecked(index in (0, 2, 7))
+        for editor in window.training.target_editors.values():
+            for index, box in enumerate(editor.electrode_boxes):
+                box.setChecked(index in (0, 2, 7))
         features = window.target_features
         assert {t: e.eeg.electrodes for t, e in features.extractors.items()} ==             {"valence": ("Fz", "Cz", "PO8"), "arousal": ("Fz", "Cz", "PO8")}
         assert features.channel_indices == {"valence": (0, 2, 7), "arousal": (0, 2, 7)}

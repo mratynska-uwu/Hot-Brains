@@ -16,6 +16,8 @@ from hotbrain.dataset import StimulusImage, load_dataset
 from hotbrain.features import EpochSpec, FeatureExtractor, higuchi_fd
 from hotbrain.training import MultiTrainer, TrialPlan, balanced_unique_capacity, predict_saved
 
+from conftest import classic_config
+
 ROOT = Path(__file__).resolve().parents[1]
 EEG = EEGSettings.from_dict(CONFIG["eeg"])
 N_CH = len(EEG.electrodes)
@@ -93,8 +95,10 @@ def test_target_formula_from_weighted_columns():
     spec = TargetSpec.from_dict("valence", {"columns": {"positive_mean": 1, "negative_mean": -1}})
     assert spec.formula == "positive_mean - negative_mean"
     assert spec.value({"positive_mean": "6", "negative_mean": "1.5"}) == 4.5
-    with pytest.raises(ValueError, match="exactly one"):
+    with pytest.raises(ValueError, match="at most one"):
         TargetSpec.from_dict("x", {"column": "a", "columns": {"b": 1}})
+    with pytest.raises(ValueError, match="needs 'column', 'columns' or 'conditions'"):
+        TargetSpec.from_dict("x", {})
 
 
 def test_config_rejects_unknown_electrode_in_region():
@@ -105,28 +109,57 @@ def test_config_rejects_unknown_electrode_in_region():
 
 
 def test_real_dataset_loads_with_valence_and_arousal_labels():
-    """data/training/images + data/training/records.csv, trials balanced by valence class."""
+    """data/training/images + records.csv: only clear-cut images, balanced across three stimulus conditions."""
     dataset = load_dataset(AppConfig.from_dict(CONFIG, ROOT))
-    assert set(dataset.groups) == {"valence=negative", "valence=positive"}
-    negative, positive = dataset.groups["valence=negative"], dataset.groups["valence=positive"]
-    assert len(negative) + len(positive) == len(list((ROOT / "data/training/images").iterdir()))
-    assert all(i.labels["valence"] == 0 for i in negative) and all(i.labels["valence"] == 1 for i in positive)
-    assert all(i.path.parent.name == "images" for i in negative + positive)
+    assert list(dataset.groups) == ["negative", "positive", "neutral"]
+    negative, positive, neutral = (dataset.groups[g] for g in ("negative", "positive", "neutral"))
     rows = {r["image_name"]: r for r in csv.DictReader(open(ROOT / "data/training/records.csv", encoding="utf-8"))}
     for r in rows.values():
         assert np.isclose(float(r["valence"]), float(r["positive_mean"]) - float(r["negative_mean"]))
         assert r["arousal"] == r["aroused_mean"]
+    # Image files only: subfolders such as images/neutrals (control images) are not training stimuli.
+    files = {p.name for p in (ROOT / "data/training/images").iterdir() if p.is_file()}
+    shown = negative + positive + neutral
+    assert all(i.path.parent.name == "images" for i in shown)
+    # Clear-cut emotional images: |valence| >= 2 and arousal >= 2.2; every Neutral-category image.
+    for image in negative + positive:
+        row = rows[image.path.name]
+        assert row["target_emotion"] != "Neutral" and float(row["arousal"]) >= 2.2
+        assert (float(row["valence"]) <= -2) if image in negative else (float(row["valence"]) >= 2)
+    assert {i.path.name for i in neutral} == {n for n in files if rows.get(n, {}).get("target_emotion") == "Neutral"}
+    assert dataset.not_in_any_condition == len(files) - len(shown) > 0
+    # Valence: negative 0 / positive 1, neutral images have no valence label.
+    assert all(i.labels["valence"] == 0 for i in negative) and all(i.labels["valence"] == 1 for i in positive)
+    assert all(i.labels["valence"] is None for i in neutral)
+    # Arousal: emotional (both valences) 1 vs neutral 0, and its value is that label.
+    assert all(i.labels["arousal"] == 1 and i.values["arousal"] == 1.0 for i in negative + positive)
+    assert all(i.labels["arousal"] == 0 and i.values["arousal"] == 0.0 for i in neutral)
+    assert dataset.thresholds["arousal"] is None and dataset.normalized("arousal", 0.0) == -1.0
     first = positive[0]
     assert np.isclose(first.values["valence"], float(rows[first.path.name]["valence"]))
-    assert np.isclose(first.values["arousal"], float(rows[first.path.name]["arousal"]))
     # CSV rows whose image file is absent are skipped and reported, not fatal.
-    assert dataset.rows_without_image == sorted(set(rows) - {i.path.name for i in negative + positive})
-    arousal = [i.labels["arousal"] for i in negative + positive if i.labels["arousal"] is not None]
-    assert 0 < sum(arousal) < len(arousal)
-    # exclude_middle drops about a third of the images from arousal training
-    excluded = sum(i.labels["arousal"] is None for i in negative + positive)
-    assert abs(excluded / len(negative + positive) - 1 / 3) < .02
-    assert dataset.thresholds["arousal"] is not None
+    assert dataset.rows_without_image == sorted(set(rows) - files)
+    assert "not shown" in dataset.summary()
+
+
+def test_condition_rules_and_validation():
+    from hotbrain.config import ConditionSpec
+    clear = ConditionSpec.from_dict("c", {"kind": {"not": ["Neutral"]}, "v": {"min": 2}, "a": ["x", "y"]})
+    assert clear.matches({"kind": "Joy", "v": "2.0", "a": "x"})
+    assert not clear.matches({"kind": "Neutral", "v": "3", "a": "x"})
+    assert not clear.matches({"kind": "Joy", "v": "1.9", "a": "x"})
+    assert not clear.matches({"kind": "Joy", "v": "3", "a": "z"})
+    with pytest.raises(ValueError, match="min must not exceed max"):
+        ConditionSpec.from_dict("c", {"v": {"min": 2, "max": 1}})
+    config = copy.deepcopy(CONFIG)
+    config["targets"]["valence"]["conditions"]["calm"] = 1
+    with pytest.raises(ValueError, match="undefined conditions"):
+        AppConfig.from_dict(config, ROOT)
+    config = copy.deepcopy(CONFIG)
+    del config["targets"]["arousal"]["conditions"]["neutral"]
+    with pytest.raises(ValueError, match="label 0 and 1|labels 0 and 1"):
+        AppConfig.from_dict(config, ROOT)
+    assert AppConfig.from_dict(CONFIG, ROOT).n_trial_groups == 3
 
 
 def test_dataset_with_explicitly_named_metadata_csv(tmp_path):
@@ -138,7 +171,7 @@ def test_dataset_with_explicitly_named_metadata_csv(tmp_path):
         lines.append(f"{name},{valence},{arousal}")
     lines.append("missing.png,1,1.0")
     (tmp_path / "data" / "set" / "records.csv").write_text("\n".join(lines), encoding="utf-8")
-    config = copy.deepcopy(CONFIG)
+    config = classic_config()
     config["datasets"] = [{"images": "set/images", "metadata": "set/records.csv"}]
     app_config = AppConfig.from_dict(config, tmp_path)
     assert app_config.n_trial_groups == 2
@@ -168,7 +201,7 @@ def _write_dataset(root: Path, rows: dict[str, list[tuple[str, int, float]]]):
 def test_dataset_folders_are_a_parameter_and_constant_targets_are_rejected(tmp_path):
     _write_dataset(tmp_path, {"a/pos": [("p1.png", 1, 2.0), ("p2.png", 1, 5.0)],
                               "a/neg": [("n1.png", 0, 1.0)]})
-    config = copy.deepcopy(CONFIG)
+    config = classic_config()
     config["datasets"] = ["a/pos", "a/neg"]
     config["targets"]["arousal"]["exclude_middle"] = 0
     dataset = load_dataset(AppConfig.from_dict(config, tmp_path))
@@ -245,10 +278,12 @@ def test_optional_feature_families():
     eeg = copy.deepcopy(CONFIG["eeg"])
     eeg["features"] = ["band_power", "fractal_dimension", "region_band_power", "asymmetry", "erp"]
     extractor = FeatureExtractor(EEGSettings.from_dict(eeg))
-    spec = extractor.epoch_spec(1000)
+    with pytest.raises(ValueError, match="1.1 s"):
+        extractor.epoch_spec(1000)                # the last ERP window ends at 800 ms (+300 ms margin)
+    spec = extractor.epoch_spec(1100)
     features = extractor.extract(np.random.default_rng(5).normal(0, 4, (spec.n_samples, N_CH)), spec)
-    # + 4 regions x 4 bands + 2 pairs x 4 bands of asymmetry + 3 ERP windows x 4 regions
-    assert features.shape == (40 + 16 + 8 + 12,)
+    # + 4 regions x 4 bands + 2 pairs x 4 bands of asymmetry + 4 ERP windows x 4 regions
+    assert features.shape == (40 + 16 + 8 + 16,)
     # A single-electrode region averages the same spectrum as that electrode.
     fz = extractor.indices("band_power", location="Fz")
     frontal = extractor.indices("region_band_power", location="frontal")

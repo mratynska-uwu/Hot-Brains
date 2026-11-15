@@ -19,9 +19,25 @@ CONFIG: dict[str, Any] = {
     # The CSV needs one row per image; extra rows without an image file are reported.
     "datasets": [{"images": "training/images", "metadata": "training/records.csv"}],
     # Training trials are balanced across these groups and the 80/20 split is
-    # stratified by them: a target name (e.g. "valence" = its two classes) or
-    # None to balance across the dataset folders.
-    "balance_by": "valence",
+    # stratified by them: "conditions" (the stimulus conditions below), a
+    # target name (e.g. "valence" = its two classes) or None (dataset folders).
+    "balance_by": "conditions",
+    # Stimulus conditions: only images matching one of them are shown (the first
+    # match wins), so every trial is a clear-cut example for at least one target.
+    # Each condition is a set of rules on metadata CSV columns, all of which must
+    # hold: a list of allowed values, {"not": [values]}, or {"min": x, "max": y}
+    # (inclusive; either bound may be left out).
+    #   negative/positive: emotional categories with clear valence (|valence| >= 2)
+    #                      and arousal above the lowest third of emotional images
+    #                      (2.2), so the late positive potential is large
+    #   neutral:           the "Neutral" category (arousal 1.4-2.6, mean 1.9)
+    # With the current dataset: 91 negative, 246 positive, 59 neutral images
+    # (170 images with weak valence or low arousal are not shown).
+    "conditions": {
+        "negative": {"target_emotion": {"not": ["Neutral"]}, "valence": {"max": -2.0}, "arousal": {"min": 2.2}},
+        "positive": {"target_emotion": {"not": ["Neutral"]}, "valence": {"min": 2.0}, "arousal": {"min": 2.2}},
+        "neutral": {"target_emotion": ["Neutral"]},
+    },
     # Column in the metadata CSV that holds the image file name.
     "image_column": "image_name",
     # Training/validation split of the datasets above, stratified per folder
@@ -31,6 +47,22 @@ CONFIG: dict[str, Any] = {
     # Subfolders of data_dir for the test session (same CSV convention; the CSV
     # needs the target columns, e.g. valence and arousal). Not available yet.
     "test_datasets": ["test"],
+    # Image presentation defaults (all editable in the GUI).
+    #   image_s      how long each training/validation image stays on screen
+    #   between      what fills the gap between images: "fixation" (cross) or
+    #                "neutral" (a neutral control image, repeated as needed)
+    #   fixation_s   [min, max] random fixation duration
+    #   neutral_s    neutral-image duration
+    # 3 s images with a 1.5-2 s fixation give ~12 trials per minute (20 s images:
+    # ~2.5). The evoked responses (P1/N1, EPN, P3, LPP) are over within ~1 s and
+    # configuration 3 analyses 0-3 s; the fixation still covers the -500..-200 ms baseline.
+    "presentation": {"image_s": 3.0, "between": "fixation", "fixation_s": [1.5, 2.0], "neutral_s": 20.0},
+    # Folder (under data_dir) with neutral control images shown between trials
+    # when "between" is "neutral". No metadata CSV is needed; images may repeat.
+    # Note: these images are also trials of the "neutral" condition, so with
+    # "between": "neutral" they would be seen outside trials too; keep
+    # "fixation" or point this at a folder without trial images.
+    "neutral_images": "training/images/neutrals",
     "test_session": {
         "trial_s": 15.0,     # how long each test image (and its target) is shown
         "rest_s": 5.0,       # fixation between test images
@@ -60,12 +92,13 @@ CONFIG: dict[str, Any] = {
     "stop_rule": {"enabled": False, "target": "valence", "balanced_accuracy": 65.0, "min_predictions": 40},
     # Training-quality report written after every training / calibration run.
     "report": {"cv_folds": 5, "permutations": 100, "label_issue_threshold": 0.2, "seed": 0},
-    # Two selectable feature configurations (GUI "Configuration"). Each target
+    # Three selectable feature configurations (GUI "Configuration"). Each target
     # has its own electrodes, bands and feature families; electrodes may be
     # "all" and are further limited by the GUI's model-electrode checkboxes.
     #   window_ms   analysis window after image onset; None = until 300 ms
-    #               before the image disappears
-    #   baseline_ms pre-onset interval subtracted per channel
+    #               before the image disappears. A target may override it
+    #               with its own "window_ms".
+    #   baseline_ms pre-onset interval subtracted per channel (shared)
     "profiles": {
         1: {"name": "Full spectrum · all electrodes",
             "window_ms": None,
@@ -83,6 +116,28 @@ CONFIG: dict[str, Any] = {
                 "arousal": {"electrodes": ["PO7", "Oz", "PO8"], "bands": ["alpha"], "features": ["band_power"]},
                 "valence": {"electrodes": ["Fz", "C3", "Cz", "C4"], "bands": ["beta", "gamma"],
                             "features": ["band_power"]},
+            }},
+        # Configuration 3: built for few trials (train it with the shrinkage LDA,
+        # "lda_shrinkage"). Rules: few, spatially averaged, well-replicated
+        # picture-viewing markers instead of many per-electrode features; no Fz
+        # (blinks would reject whole trials) and no gamma (facial EMG on dry
+        # electrodes). Each target has 16-18 features.
+        #   arousal: centro-parietal LPP and posterior EPN (ERP region means in
+        #            the eeg.erp_windows_ms windows) + theta/alpha region power
+        #            (posterior alpha desynchronisation for arousing pictures)
+        #   valence: same early/late ERPs (negativity bias in P1/N1 and EPN) +
+        #            right-minus-left theta/alpha asymmetry (C4-C3, PO8-PO7)
+        #   bandpass_hz 0.1-30 Hz for these features only: a 1 Hz high-pass keeps
+        #            ~20% of a 4 µV LPP. Artifact rejection still uses eeg.bandpass_hz.
+        3: {"name": "Small-sample · ERP (LPP/EPN) + theta/alpha · 3 s · use shrinkage LDA",
+            "window_ms": 3000,
+            "baseline_ms": [-500, -200],
+            "bandpass_hz": [0.1, 30],
+            "targets": {
+                "arousal": {"electrodes": ["C3", "Cz", "C4", "Pz", "PO7", "Oz", "PO8"],
+                            "bands": ["theta", "alpha"], "features": ["erp", "region_band_power"]},
+                "valence": {"electrodes": ["C3", "Cz", "C4", "Pz", "PO7", "Oz", "PO8"],
+                            "bands": ["theta", "alpha"], "features": ["erp", "asymmetry"]},
             }},
     },
     "default_profile": 1,
@@ -123,7 +178,9 @@ CONFIG: dict[str, Any] = {
         # (right, left) pairs used by "asymmetry".
         "asymmetry_pairs": [["C4", "C3"], ["PO8", "PO7"]],
         # Windows after image onset used by "erp"; None = end of the epoch.
-        "erp_windows_ms": [[100, 200], [200, 350], [350, None]],
+        # P1/N1, early posterior negativity (EPN), P3 and late positive potential
+        # (LPP). Bounded, so a long analysis window does not dilute the LPP.
+        "erp_windows_ms": [[100, 200], [200, 300], [300, 450], [450, 800]],
     },
     # What to classify. Each target gets one value per image, either a single
     # CSV column ("column") or a weighted sum of columns ("columns": {name:
@@ -135,12 +192,20 @@ CONFIG: dict[str, Any] = {
     # (> 0 means rated more positive than negative) and arousal = aroused_mean.
     # A dataset without them could use {"columns": {"positive_mean": 1,
     # "negative_mean": -1}} instead.
+    # "conditions" maps stimulus conditions to labels 0/1 and overrides the
+    # threshold; images of unlisted conditions get no label for that target. A
+    # target without a column takes its value from that label (0/1).
+    # exclude_middle (with a threshold, no conditions) drops the middle share of
+    # images, e.g. 1/3 for a median split without the images near the median.
     "targets": {
-        "valence": {"column": "valence", "threshold": 0, "classes": ["negative", "positive"]},
-        # exclude_middle: drop the middle share of images (by the training images'
-        # quantiles) from this target's training, keeping only clearly low/high ones.
-        "arousal": {"column": "arousal", "threshold": "median", "classes": ["low", "high"],
-                    "exclude_middle": 1 / 3},
+        # Neutral images are not part of valence (they used to be labelled positive).
+        "valence": {"column": "valence", "threshold": 0, "classes": ["negative", "positive"],
+                    "conditions": {"negative": 0, "positive": 1}},
+        # Emotional (arousing, both valences) vs neutral pictures: the most robust
+        # single-trial late positive potential contrast. It replaces the median
+        # split of the arousal rating, whose two classes overlapped heavily.
+        "arousal": {"classes": ["neutral", "emotional"],
+                    "conditions": {"neutral": 0, "negative": 1, "positive": 1}},
     },
     # Keys from hotbrain.classifiers.CLASSIFIERS selected by default in the GUI.
     "classifiers": ["svm"],
@@ -277,11 +342,27 @@ class TargetSpec:
     threshold: float | str | None
     classes: tuple[str, str]
     exclude_middle: float = 0.0   # share of images around the threshold left out of training
+    # Stimulus condition -> label. When set, labels come from the image's condition
+    # (unlisted conditions: no label); without columns the value is that label.
+    condition_labels: tuple[tuple[str, int], ...] = ()
 
     @classmethod
     def from_dict(cls, name: str, d: dict) -> "TargetSpec":
-        if ("column" in d) == ("columns" in d):
-            raise ValueError(f"targets.{name} needs exactly one of 'column' or 'columns'")
+        conditions = d.get("conditions")
+        condition_labels = () if conditions is None else tuple((str(c), int(l)) for c, l in conditions.items())
+        if conditions is not None and {l for _, l in condition_labels} != {0, 1}:
+            raise ValueError(f"targets.{name}.conditions must map stimulus conditions to labels 0 and 1, using both")
+        if "column" in d and "columns" in d:
+            raise ValueError(f"targets.{name} needs at most one of 'column' or 'columns'")
+        if "column" not in d and "columns" not in d:
+            if not condition_labels:
+                raise ValueError(f"targets.{name} needs 'column', 'columns' or 'conditions'")
+            if d.get("threshold") is not None or d.get("exclude_middle"):
+                raise ValueError(f"targets.{name}: a target defined only by conditions has no threshold")
+            classes = tuple(str(c) for c in d.get("classes", ("0", "1")))
+            if len(classes) != 2:
+                raise ValueError(f"targets.{name}.classes must have exactly two names (label 0, label 1)")
+            return cls(str(name), (), None, classes, 0.0, condition_labels)
         columns = ((str(d["column"]), 1.0),) if "column" in d else \
             tuple((str(c), float(w)) for c, w in d["columns"].items())
         if not columns:
@@ -295,11 +376,18 @@ class TargetSpec:
         exclude = float(d.get("exclude_middle", 0.0) or 0.0)
         if not 0 <= exclude < 1 or (exclude and threshold is None):
             raise ValueError(f"targets.{name}.exclude_middle must be in [0, 1) and needs a threshold")
-        return cls(str(name), columns, threshold, classes, exclude)
+        if exclude and condition_labels:
+            raise ValueError(f"targets.{name}: exclude_middle and conditions cannot be combined")
+        return cls(str(name), columns, threshold, classes, exclude, condition_labels)
+
+    def condition_label(self, condition: str | None) -> int | None:
+        return dict(self.condition_labels).get(condition)
 
     @property
     def formula(self) -> str:
-        """Readable definition, e.g. 'positive_mean - negative_mean'."""
+        """Readable definition, e.g. 'positive_mean - negative_mean' or 'condition: neutral=0, negative=1'."""
+        if not self.columns:
+            return "condition: " + ", ".join(f"{c}={l}" for c, l in self.condition_labels)
         out = ""
         for i, (column, weight) in enumerate(self.columns):
             sign = "-" if weight < 0 else "+"
@@ -312,10 +400,62 @@ class TargetSpec:
 
 
 @dataclass(frozen=True)
+class ConditionSpec:
+    """One stimulus condition: every rule on a metadata CSV column must hold.
+
+    A rule is ("in", values), ("not", values) or ("range", (min, max)) with
+    inclusive, optional (None) bounds.
+    """
+    name: str
+    rules: tuple[tuple[str, str, Any], ...]
+
+    @classmethod
+    def from_dict(cls, name: str, d: dict) -> "ConditionSpec":
+        if not isinstance(d, dict) or not d:
+            raise ValueError(f"conditions.{name} must be a non-empty dict of column rules")
+        rules = []
+        for column, rule in d.items():
+            if isinstance(rule, (list, tuple)):
+                rules.append((str(column), "in", tuple(str(v) for v in rule)))
+            elif isinstance(rule, dict) and set(rule) == {"not"}:
+                rules.append((str(column), "not", tuple(str(v) for v in rule["not"])))
+            elif isinstance(rule, dict) and rule and set(rule) <= {"min", "max"}:
+                lo, hi = rule.get("min"), rule.get("max")
+                lo, hi = None if lo is None else float(lo), None if hi is None else float(hi)
+                if lo is not None and hi is not None and lo > hi:
+                    raise ValueError(f"conditions.{name}.{column}: min must not exceed max")
+                rules.append((str(column), "range", (lo, hi)))
+            else:
+                raise ValueError(f"conditions.{name}.{column} must be a list of values, "
+                                 "{'not': [values]} or {'min': x, 'max': y}")
+        return cls(str(name), tuple(rules))
+
+    def matches(self, row: dict[str, str]) -> bool:
+        """True when the CSV row satisfies every rule (KeyError if a column is missing)."""
+        for column, kind, payload in self.rules:
+            raw = row[column]
+            if kind == "in" and raw not in payload or kind == "not" and raw in payload:
+                return False
+            if kind == "range":
+                try:
+                    value = float(raw)
+                except ValueError:
+                    raise ValueError(f"Condition {self.name!r}: column {column!r} is not numeric ({raw!r})") from None
+                lo, hi = payload
+                if (lo is not None and value < lo) or (hi is not None and value > hi):
+                    return False
+        return True
+
+
+@dataclass(frozen=True)
 class TargetFeatureSpec:
     electrodes: tuple[str, ...] | None   # None = all configured electrodes
     bands: tuple[str, ...]
     features: tuple[str, ...]
+    window_ms: int | None = None         # analysis window after onset; None = until 300 ms before image end
+    # Feature-extraction bandpass; None = eeg.bandpass_hz. Artifact rejection always
+    # uses eeg.bandpass_hz. ERP features need a low high-pass (~0.1 Hz): 1 Hz removes most of the LPP.
+    bandpass_hz: tuple[float, float] | None = None
 
 
 @dataclass(frozen=True)
@@ -355,7 +495,17 @@ class Profile:
             features = tuple(str(f) for f in t.get("features", ("band_power",)))
             if not features or set(features) - set(EEGSettings.FEATURE_FAMILIES):
                 raise ValueError(f"profiles.{number}.{target}.features must come from {EEGSettings.FEATURE_FAMILIES}")
-            specs.append((target, TargetFeatureSpec(electrodes, bands, features)))
+            target_window = t.get("window_ms", window)
+            target_window = None if target_window is None else int(target_window)
+            if target_window is not None and target_window < 100:
+                raise ValueError(f"profiles.{number}.{target}.window_ms must be at least 100 ms")
+            bandpass = t.get("bandpass_hz", d.get("bandpass_hz"))
+            if bandpass is not None:
+                bandpass = tuple(float(v) for v in bandpass)
+                if len(bandpass) != 2 or not 0 < bandpass[0] < bandpass[1] < eeg.fs / 2:
+                    raise ValueError(f"profiles.{number}.{target}.bandpass_hz must satisfy "
+                                     "0 < low < high < sampling_rate/2")
+            specs.append((target, TargetFeatureSpec(electrodes, bands, features, target_window, bandpass)))
         return cls(int(number), str(d.get("name", f"Configuration {number}")), window, (b0, b1), tuple(specs))
 
 
@@ -386,6 +536,11 @@ class AppConfig:
     report: dict | None = None
     on_target_distance: float = 0.35
     practice_images: int = 3
+    presentation: dict | None = None
+    neutral_dir: Path | None = None
+    conditions: tuple[ConditionSpec, ...] = ()
+
+    BETWEEN_MODES = ("fixation", "neutral")
 
     def profile(self, number: int) -> Profile:
         for profile in self.profiles:
@@ -396,6 +551,8 @@ class AppConfig:
     @property
     def n_trial_groups(self) -> int:
         """Groups a finite training run is balanced across (the trial count must be a multiple)."""
+        if self.balance_by == "conditions":
+            return len(self.conditions)
         return 2 if self.balance_by else len(self.datasets)
 
     def metadata_path(self, folder: str) -> Path:
@@ -426,9 +583,20 @@ class AppConfig:
         targets = tuple(TargetSpec.from_dict(name, t) for name, t in d["targets"].items())
         if not targets:
             raise ValueError("targets must define at least one classification target")
+        conditions = tuple(ConditionSpec.from_dict(name, c) for name, c in (d.get("conditions") or {}).items())
+        condition_names = {c.name for c in conditions}
+        for t in targets:
+            unknown_conditions = {c for c, _ in t.condition_labels} - condition_names
+            if unknown_conditions:
+                raise ValueError(f"targets.{t.name}.conditions names undefined conditions {sorted(unknown_conditions)}")
+            if not t.columns and condition_names - {c for c, _ in t.condition_labels}:
+                raise ValueError(f"targets.{t.name} has no value column, so it needs a label for every condition")
         balance_by = d.get("balance_by")
-        if balance_by is not None and balance_by not in {t.name for t in targets}:
-            raise ValueError(f"balance_by must be a target name or None, got {balance_by!r}")
+        if balance_by == "conditions":
+            if len(conditions) < 2:
+                raise ValueError("balance_by 'conditions' needs at least two conditions")
+        elif balance_by is not None and balance_by not in {t.name for t in targets}:
+            raise ValueError(f"balance_by must be 'conditions', a target name or None, got {balance_by!r}")
         classifiers = tuple(d.get("classifiers", ("svm",)))
         unknown = [c for c in classifiers if c not in CLASSIFIERS]
         if unknown:
@@ -464,10 +632,21 @@ class AppConfig:
         stop_rule = {"enabled": False, "target": target_names[0], "balanced_accuracy": 65.0,
                      "min_predictions": 40, **d.get("stop_rule", {})}
         report = {"cv_folds": 5, "permutations": 100, "label_issue_threshold": 0.2, "seed": 0, **d.get("report", {})}
-        return cls(data_dir if data_dir.is_absolute() else root / data_dir, datasets,
+        presentation = {"image_s": 20.0, "between": "fixation", "fixation_s": [2.0, 3.0], "neutral_s": 20.0,
+                        **d.get("presentation", {})}
+        fix_lo, fix_hi = (float(v) for v in presentation["fixation_s"])
+        presentation["fixation_s"] = [fix_lo, fix_hi]
+        if presentation["between"] not in cls.BETWEEN_MODES:
+            raise ValueError(f"presentation.between must be one of {cls.BETWEEN_MODES}")
+        if not 0 < fix_lo <= fix_hi or float(presentation["image_s"]) <= 0 or float(presentation["neutral_s"]) <= 0:
+            raise ValueError("presentation durations must be positive (fixation_s as [min <= max])")
+        data_root = data_dir if data_dir.is_absolute() else root / data_dir
+        neutral = d.get("neutral_images")
+        return cls(data_root, datasets,
                    str(d.get("image_column", "image_name")), eeg,
                    targets, classifiers, d, fraction, int(split.get("seed", 42)),
                    test_datasets, trial_s, rest_s, update_s, smoothing,
                    dataset_metadata + test_metadata, balance_by, profiles, default_profile, calibration,
                    float(d.get("resting", {}).get("duration_s", 90.0)), stop_rule, report,
-                   float(feedback.get("on_target_distance", 0.35)), int(feedback.get("practice_images", 3)))
+                   float(feedback.get("on_target_distance", 0.35)), int(feedback.get("practice_images", 3)),
+                   presentation, None if not neutral else data_root / str(neutral), conditions)
