@@ -40,20 +40,31 @@ class SignalQuality:
         if len(data) < self.window:
             return self.waiting(f"Waiting for {WINDOW_SECONDS} seconds of EEG")
         low, high = self.eeg.bandpass_hz
-        recent = data[-self.window:].copy()
-        finite = np.isfinite(recent).all(axis=0)
-        recent[:, ~finite] = 0  # Keep one bad electrode from affecting the others.
-        filtered = sosfiltfilt(self.sos, recent, axis=0)
-        rms_values = np.sqrt(np.mean(filtered ** 2, axis=0))
-        swings = np.ptp(filtered, axis=0)
+        recent = data[-self.window:]
         results = []
         for index in range(n):
-            if not finite[index]:
-                results.append(ChannelQuality(False, "Non-finite samples"))
+            finite = np.isfinite(recent[:, index])
+            valid_percent = 100 * float(finite.mean())
+            if valid_percent < 80:
+                results.append(ChannelQuality(False, f"Only {valid_percent:.1f}% real scans in the last 2 s"))
                 continue
-            rms = float(rms_values[index])
-            swing = float(swings[index])
-            detail = f"{low:g}–{high:g} Hz RMS {rms:.1f} µV; range {swing:.1f} µV"
+            # A dropped Bluetooth scan is not evidence that every electrode
+            # lost contact. Filter an uninterrupted real segment; never fill
+            # missing scans or let a gap become a large filter transient.
+            edges = np.diff(np.r_[False, finite, False].astype(np.int8))
+            starts = np.flatnonzero(edges == 1)
+            ends = np.flatnonzero(edges == -1)
+            lengths = ends - starts
+            longest = int(np.argmax(lengths))
+            if lengths[longest] < self.eeg.fs // 2:
+                results.append(ChannelQuality(None, "Waiting for 0.5 s of uninterrupted real EEG"))
+                continue
+            segment = recent[starts[longest]:ends[longest], index]
+            filtered = sosfiltfilt(self.sos, segment)
+            rms = float(np.sqrt(np.mean(filtered ** 2)))
+            swing = float(np.ptp(filtered))
+            detail = (f"{low:g}–{high:g} Hz RMS {rms:.1f} µV; range {swing:.1f} µV; "
+                      f"{valid_percent:.1f}% real scans, {len(segment) / self.eeg.fs:.1f} s checked")
             if rms < 1 or swing < 4:
                 results.append(ChannelQuality(False, f"Flat or very weak signal · {detail}"))
             elif rms > 75 or swing > 300:

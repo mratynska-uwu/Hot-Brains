@@ -31,6 +31,10 @@ class NoDevice(QObject):
         self.serial = serial
         self.ring = SampleRing(fs=eeg.fs, channels=eeg.device_channels)
         self._marker_code = 0
+        self.retry_calls = 0
+
+    def retry_now(self):
+        self.retry_calls += 1
 
     def provide_test_frames(self):
         # Isolated unit-test fixture; the application never synthesizes EEG.
@@ -110,18 +114,22 @@ def test_chosen_key_stops_from_presentation_window(tmp_path: Path, monkeypatch):
         window.training.count.setValue(160)
         assert not window.training.start.isEnabled()
         assert window.features.raw_sample_count == 0
+        assert "NO LIVE EEG" in window.features.source_status.text()
+        window.features.reconnect.click()
+        assert window.device.retry_calls == 1
+        assert "CHECKING UNICORN" in window.features.source_status.text()
         assert all("Waiting" in label.text() for label in window.features.quality_labels)
         window.start_run()
         assert not window.active
         assert window.shown == 0
         assert window.presentation.stimulus.state == "idle"
         assert not window.features.samples
-        assert window.training.image_seconds.value() == 3.0
+        assert window.training.image_seconds.value() == 1.5
         assert all(timer.timerType() == Qt.TimerType.PreciseTimer for timer in
                    (window.warmup_timer, window.fixation_timer, window.image_timer))
-        assert window.training.fixation_min.value() == 2.0
-        assert window.training.fixation_max.value() == 3.0
-        assert "+2700 ms" in window.presentation.note.text()
+        assert window.training.fixation_min.value() == 1.0
+        assert window.training.fixation_max.value() == 1.5
+        assert "+1200 ms" in window.presentation.note.text()
         assert window.training.selected_model_pairs() == [("valence", "logreg")]
         for index, box in enumerate(window.training.electrode_boxes):
             box.setChecked(index in (0, 2, 7))
@@ -157,13 +165,27 @@ def test_chosen_key_stops_from_presentation_window(tmp_path: Path, monkeypatch):
         window.training.fixation_min.setValue(2.0)
         window.training.fixation_max.setValue(4.0)
         assert "+1700 ms" in window.presentation.note.text()
-        for key_name, key_code in (("Escape", Qt.Key.Key_Escape), ("F8", Qt.Key.Key_F8)):
+        for key_index, (key_name, key_code) in enumerate((("Escape", Qt.Key.Key_Escape), ("F8", Qt.Key.Key_F8))):
             window.device.provide_test_frames()
             window.poll()
             assert window.training.start.isEnabled()
-            assert not window.features.samples
+            assert window.features.samples, (window.epoch_spec.n_samples,
+                                             window.device.ring.received_samples,
+                                             window.features.live_features.isChecked())
             assert window.features.raw_sample_count >= 500
             assert all("Good" in label.text() for label in window.features.quality_labels)
+            feature_count = len(window.features.samples)
+            raw_count = window.features.raw_sample_count
+            window.features.live_raw.click()
+            window.features.live_features.click()
+            assert not window.features.live_raw.isChecked()
+            assert not window.features.live_features.isChecked()
+            window.device.provide_test_frames()
+            window.poll()
+            assert window.features.raw_sample_count == raw_count
+            assert len(window.features.samples) == feature_count
+            window.features.live_raw.click()
+            window.features.live_features.click()
             if key_name == "Escape":
                 for pair, box in window.training.train_boxes.items():
                     box.setChecked(pair == ("valence", "svm"))
@@ -174,9 +196,26 @@ def test_chosen_key_stops_from_presentation_window(tmp_path: Path, monkeypatch):
             window.start_run()
             app.processEvents()
             assert window.active
+            assert window.gabor_stage == "trials"
+            assert window.shown == 0  # visual-check trials do not enter scene training
+            window.fixation_timer.stop()
+            window.show_trial()
+            app.processEvents()
+            assert window.gabor_shown == 1
+            assert window.shown == 0
+            assert window.presentation.stimulus.state in ("gabor", "gray")
+            assert not window.features.reconnect.isEnabled()
             window.poll()
             assert window.features.samples
-            assert window.features.raw_sample_count == 0
+            assert window.features.raw_sample_count >= 500
+            assert window.features.live_raw.isEnabled()
+            assert window.features.live_features.isEnabled()
+            window.features.live_raw.click()
+            window.features.live_features.click()
+            assert not window.features.live_raw.isChecked()
+            assert not window.features.live_features.isChecked()
+            window.features.live_raw.click()
+            window.features.live_features.click()
             assert not window.features.oscar_toggle.isEnabled()
             assert window.training.settings_scroll.isHidden()
             assert window.training.accuracy.columnCount() == 6
@@ -195,24 +234,36 @@ def test_chosen_key_stops_from_presentation_window(tmp_path: Path, monkeypatch):
             QTest.keyClick(presentation, key_code)
             app.processEvents()
             assert not window.active
+            deadline = time.perf_counter() + 3
+            while window.finishing and time.perf_counter() < deadline:
+                app.processEvents()
+                window.poll()
+            assert not window.finishing
+            archived = list((tmp_path / "recordings").glob("*.session.json"))
+            assert len(archived) == key_index + 1
             assert not window.stop_shortcut.isEnabled()
             assert not window.training.save.isEnabled()
             frozen_count = len(window.features.samples)
             frozen_value = window.features.current.text()
-            frozen_lights = list(window.features.quality_map.ratings)
+            window.features.live_features.click()
             window.device.provide_test_frames()
             window.poll()
             assert len(window.features.samples) == frozen_count
             assert window.features.current.text() == frozen_value
-            assert window.features.quality_map.ratings == frozen_lights
+            # Electrode quality remains a live diagnostic after training stops.
+            assert len(window.features.quality_map.ratings) == 8
             assert window.features.raw_sample_count > 0
             assert window.features.oscar_toggle.isEnabled()
+            assert window.features.reconnect.isEnabled()
+            window.features.live_features.click()
             window.device.connected = False
             window.device.connected_changed.emit(False)
             assert not window.features.samples
             assert window.features.raw_sample_count == 0
+            assert "NO LIVE EEG" in window.features.source_status.text()
             assert window.features.current.text() == "Current values: —"
             window.discard_run()
+            assert all(path.exists() for path in archived)
             assert not window.training.start.isEnabled()
             assert not window.training.settings_scroll.isHidden()
         window.device.provide_test_frames()
@@ -223,6 +274,11 @@ def test_chosen_key_stops_from_presentation_window(tmp_path: Path, monkeypatch):
             window.device.ring._last_arrival -= 2
         window.poll()
         assert not window.active
+        deadline = time.perf_counter() + 3
+        while window.finishing and time.perf_counter() < deadline:
+            app.processEvents()
+            window.poll()
+        assert not window.finishing
         assert "EEG stream stopped" in window.training.status.text()
         window.device.connected = False
         window.device.connected_changed.emit(False)
@@ -261,6 +317,7 @@ def test_chosen_key_stops_from_presentation_window(tmp_path: Path, monkeypatch):
         window.epoch_labels = [{"valence": 1, "arousal": 0}]
         window.epoch_values = [{"valence": 1.0, "arousal": 0.0}]
         window.epoch_groups = ["happy"]
+        window.run_metadata["evaluation_mode"] = gui.EVAL_PREQUENTIAL
         window.save_model()
         assert not window.training.save.isEnabled()
         assert len(list((tmp_path / "saved_models").glob("*.forest.joblib"))) == 1

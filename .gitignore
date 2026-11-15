@@ -2,6 +2,8 @@
 __pycache__/
 .pytest_cache/
 saved_models/
+recordings/
+output/
 install.log
 launcher.log
 .DS_Store

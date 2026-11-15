@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import queue
 import random
 import time
 from collections import deque
@@ -25,8 +26,12 @@ from .acquisition import DeviceManager
 from .config import CONFIG, AppConfig
 from .dataset import Dataset, StimulusImage, load_dataset
 from .features import EpochSpec, FeatureExtractor, START_MS
+from . import gabor_check
 from .quality import ChannelQuality, SignalQuality
-from .training import ROLLING, MultiTrainer, TrialPlan, balanced_unique_capacity
+from .recording import SessionRecorder
+from .results import RunResultsWindow
+from .training import (ROLLING, InterleavedPlan, MultiTrainer, TrialPlan,
+                       balanced_unique_capacity, select_best_checkpoints)
 from .affect_plane import AffectPlane
 from .sessions import (SESSION_TEST, SESSION_TRAINING, SESSION_VALIDATION, OncePlan, Smoother,
                        ValidationScores, affect_point, load_models, split_dataset)
@@ -60,6 +65,11 @@ class Stimulus(QWidget):
         self._emit_on_paint = True
         self.update()
 
+    def visual_check(self, present: bool):
+        self.state = "gabor" if present else "gray"
+        self._emit_on_paint = True
+        self.update()
+
     def idle(self):
         self.state = "idle"
         self._emit_on_paint = False
@@ -68,7 +78,15 @@ class Stimulus(QWidget):
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.fillRect(self.rect(), QColor("#101827"))
-        if self.state == "image":
+        if self.state == "gabor" or self.state == "gray":
+            painter.fillRect(self.rect(), QColor(128, 128, 128))
+            if self.state == "gabor":
+                painter.drawPixmap(self.rect().center().x() - self.gabor_pixmap.width() // 2,
+                                   self.rect().center().y() - self.gabor_pixmap.height() // 2,
+                                   self.gabor_pixmap)
+            painter.setPen(QColor(35, 35, 35))
+            painter.drawEllipse(self.rect().center(), 2, 2)
+        elif self.state == "image":
             size = self.pixmap.size()
             size.scale(self.rect().adjusted(24, 24, -24, -24).size(), Qt.AspectRatioMode.KeepAspectRatio)
             target = self.rect()
@@ -85,6 +103,20 @@ class Stimulus(QWidget):
         if self._emit_on_paint:
             self._emit_on_paint = False
             self.onset.emit(time.perf_counter())
+
+    @property
+    def gabor_pixmap(self):
+        if not hasattr(self, "_gabor_pixmap"):
+            n = 256
+            yy, xx = np.mgrid[:n, :n]
+            x = (xx - n / 2) / n
+            y = (yy - n / 2) / n
+            envelope = np.exp(-(x * x + y * y) / (2 * .18 ** 2))
+            pixels = np.clip(128 + 105 * envelope * np.cos(2 * np.pi * 10 * x), 0, 255).astype(np.uint8)
+            from PySide6.QtGui import QImage
+            image = QImage(pixels.data, n, n, n, QImage.Format.Format_Grayscale8).copy()
+            self._gabor_pixmap = QPixmap.fromImage(image)
+        return self._gabor_pixmap
 
 
 class PresentationPanel(QWidget):
@@ -131,8 +163,8 @@ class TrainingPanel(QWidget):
         settings_layout.setContentsMargins(0, 0, 0, 0)
         form = QFormLayout()
         self.session = QComboBox()
-        for key, label, tip in ((SESSION_TRAINING, "Training", "models learn trial by trial"),
-                                (SESSION_VALIDATION, "Validation", "held-out images, each once; frozen models"),
+        for key, label, tip in ((SESSION_TRAINING, "Training", "models learn on training trials; validation is interleaved"),
+                                (SESSION_VALIDATION, "Extra validation", "optional legacy session; unavailable after checkpoint selection"),
                                 (SESSION_TEST, "Test", "test images; match the target valence/arousal")):
             self.session.addItem(label, key)
             self.session.setItemData(self.session.count() - 1, tip, Qt.ItemDataRole.ToolTipRole)
@@ -145,8 +177,10 @@ class TrainingPanel(QWidget):
         models_row.addWidget(self.models_status, 1)
         form.addRow("Models", models_row)
         self.feedback_classifier = QComboBox()
+        self.feedback_classifier.addItem("Train or load models first")
+        self.feedback_classifier.setEnabled(False)
         self.feedback_classifier.setToolTip("Classifier whose valence/arousal estimate drives the live plane "
-                                            "in validation and test sessions.")
+                                            "in validation and test sessions. Available after training or loading models.")
         form.addRow("Live display uses", self.feedback_classifier)
         self.participant = QLineEdit("debug")
         self.participant.setPlaceholderText("Participant ID")
@@ -157,14 +191,14 @@ class TrainingPanel(QWidget):
         self.count = QSpinBox()
         self.count.setRange(self.n_groups, 100000)
         self.count.setSingleStep(self.n_groups)
-        self.count.setValue(max(self.n_groups, 160 - 160 % self.n_groups))
+        self.count.setValue(max(self.n_groups, 800 - 800 % self.n_groups))
         form.addRow("Presentations", self.count)
         self.persistent = QCheckBox("Continue until manually stopped")
         self.persistent.toggled.connect(self.count.setDisabled)
         form.addRow("Mode", self.persistent)
         self.evaluation = QComboBox()
         self.evaluation.addItem("Prequential · no repeated images", EVAL_PREQUENTIAL)
-        self.evaluation.addItem(f"Hold out {round(config.validation_fraction * 100)}% for validation", EVAL_SPLIT)
+        self.evaluation.addItem(f"Interleave {round(config.validation_fraction * 100)}% held-out validation", EVAL_SPLIT)
         form.addRow("Evaluation", self.evaluation)
         self.evaluation_status = QLabel()
         self.evaluation_status.setWordWrap(True)
@@ -174,28 +208,37 @@ class TrainingPanel(QWidget):
         self.image_seconds.setDecimals(2)
         self.image_seconds.setSingleStep(.1)
         self.image_seconds.setSuffix(" s")
-        self.image_seconds.setValue(max(3.0, min_image_s))
+        self.image_seconds.setValue(max(1.5, min_image_s))
         form.addRow("Image duration", self.image_seconds)
         self.fixation_min = QDoubleSpinBox()
         self.fixation_min.setRange(.2, 60.0)
         self.fixation_min.setDecimals(2)
         self.fixation_min.setSingleStep(.1)
         self.fixation_min.setSuffix(" s")
-        self.fixation_min.setValue(2.0)
+        self.fixation_min.setValue(1.0)
         form.addRow("Fixation minimum", self.fixation_min)
         self.fixation_max = QDoubleSpinBox()
         self.fixation_max.setRange(.2, 60.0)
         self.fixation_max.setDecimals(2)
         self.fixation_max.setSingleStep(.1)
         self.fixation_max.setSuffix(" s")
-        self.fixation_max.setValue(3.0)
+        self.fixation_max.setValue(1.5)
         form.addRow("Fixation maximum", self.fixation_max)
+        self.duration_estimate = QLabel()
+        self.duration_estimate.setWordWrap(True)
+        form.addRow("Estimated duration", self.duration_estimate)
+        self.session.currentIndexChanged.connect(self.update_duration_estimate)
+        for control in (self.count, self.image_seconds, self.fixation_min, self.fixation_max):
+            control.valueChanged.connect(self.update_duration_estimate)
+        self.persistent.toggled.connect(self.update_duration_estimate)
+        self.update_duration_estimate()
         self.stop_key = QComboBox()
         self.stop_key.addItems(["Escape", "Space", "Enter", *[f"F{i}" for i in range(1, 13)],
                                 *"ABCDEFGHIJKLMNOPQRSTUVWXYZ", *"0123456789"])
         form.addRow("Stop key", self.stop_key)
         self.oscar = QCheckBox("Enable g.Pype OSCAR artifact removal")
         self.oscar.setChecked(True)
+        self.oscar.toggled.connect(self.update_duration_estimate)
         form.addRow("EEG processing", self.oscar)
         electrode_grid = QWidget()
         electrode_layout = QGridLayout(electrode_grid)
@@ -208,9 +251,20 @@ class TrainingPanel(QWidget):
             electrode_layout.addWidget(box, index // 4, index % 4)
             self.electrode_boxes.append(box)
         form.addRow("Model electrodes", electrode_grid)
-        self.electrode_status = QLabel("All eight electrodes enter model features; diagnostics show all eight.")
+        self.electrode_status = QLabel("Scene models default to all eight, including posterior 6–8. "
+                                       "The Gabor check always uses 6–8 and never fits scene models.")
         self.electrode_status.setWordWrap(True)
         form.addRow("", self.electrode_status)
+        self.gabor_check = QCheckBox("Run short Gabor visual check before scene training")
+        self.gabor_check.setChecked(True)
+        self.gabor_check.setToolTip("120 Gabor/gray trials (~3 min), then a 5 s break. "
+                                   "Held-out score uses electrodes 6–8 only; no Gabor data fits emotion models.")
+        self.gabor_check.toggled.connect(self.update_duration_estimate)
+        form.addRow("Visual EEG check", self.gabor_check)
+        gabor_note = QLabel("Gabor vs gray · 80 fit + 40 held-out · posterior electrodes 6–8. "
+                            "This checks visual EEG acquisition, not emotion recognition.")
+        gabor_note.setWordWrap(True)
+        form.addRow("", gabor_note)
         self.warmup = QCheckBox("Wait before trials (not OSCAR calibration)")
         self.warmup.setChecked(True)
         form.addRow("Before trials", self.warmup)
@@ -219,6 +273,9 @@ class TrainingPanel(QWidget):
         self.warmup_seconds.setValue(12)
         self.warmup_seconds.setSuffix(" s")
         form.addRow("Waiting duration", self.warmup_seconds)
+        self.warmup.toggled.connect(self.update_duration_estimate)
+        self.warmup_seconds.valueChanged.connect(self.update_duration_estimate)
+        self.update_duration_estimate()
         model_grid = QWidget()
         model_layout = QGridLayout(model_grid)
         model_layout.setContentsMargins(0, 0, 0, 0)
@@ -250,7 +307,8 @@ class TrainingPanel(QWidget):
         balance = f"the {config.balance_by} classes" if config.balance_by else f"the {self.n_groups} dataset folders"
         self.detail = QLabel(f"Finite runs are exactly balanced across {balance} and shuffled; "
                              "continuous runs draw a group uniformly at random. Each target/classifier pair predicts a trial "
-                             "before that trial is added to its fit. OSCAR adapts online; g.Pype does not expose a saved calibration state.")
+                             "before fitting training trials; held-out validation trials never enter a fit. "
+                             "OSCAR adapts online; g.Pype does not expose a saved calibration state.")
         self.detail.setWordWrap(True)
         settings_layout.addWidget(self.detail)
         self.settings_scroll = QScrollArea()
@@ -263,6 +321,7 @@ class TrainingPanel(QWidget):
         self.start = QPushButton("Start session")
         self.stop = QPushButton("Stop session")
         self.save = QPushButton("Save results")
+        self.open_results = QPushButton("Open saved run…")
         self.discard = QPushButton("Discard run")
         self.stop.setEnabled(False)
         self.save.setEnabled(False)
@@ -270,6 +329,7 @@ class TrainingPanel(QWidget):
         for button in (self.start, self.stop, self.save, self.discard):
             buttons.addWidget(button)
         layout.addLayout(buttons)
+        layout.addWidget(self.open_results)
         self.stop_hint = QLabel("Press Escape in any app window to stop training.")
         self.stop_key.currentTextChanged.connect(
             lambda key: self.stop_hint.setText(f"Press {key} in any app window to stop training."))
@@ -288,6 +348,9 @@ class TrainingPanel(QWidget):
         layout.addWidget(self.device_status)
         self.count_status = QLabel("Trials: 0 · usable EEG: 0")
         layout.addWidget(self.count_status)
+        self.gabor_status = QLabel("Visual check: waiting for a training session.")
+        self.gabor_status.setWordWrap(True)
+        layout.addWidget(self.gabor_status)
         self.accuracy = QTableWidget(0, 6)
         self.accuracy.setHorizontalHeaderLabels(("Target (+)", "Model", f"Last {ROLLING} correct", "N", "P(+)", "Save"))
         self.accuracy.horizontalHeader().setStretchLastSection(True)
@@ -303,6 +366,16 @@ class TrainingPanel(QWidget):
         self.plot.showGrid(x=True, y=True, alpha=.2)
         self.plot.addLegend(offset=(-10, 10))
         layout.addWidget(self.plot, 1)
+        self.loss_plot = pg.PlotWidget()
+        self.loss_plot.setBackground("#101827")
+        self.loss_plot.setLabel("left", "Brier loss (lower is better)")
+        self.loss_plot.setLabel("bottom", "Presented trial")
+        self.loss_plot.setYRange(0, 1)
+        self.loss_plot.showGrid(x=True, y=True, alpha=.2)
+        self.loss_plot.setTitle("Dotted line: constant 50/50 Brier = 0.25")
+        self.loss_plot.addLegend(offset=(-10, 10))
+        self.loss_plot.setVisible(False)
+        layout.addWidget(self.loss_plot, 1)
         self.weights = QTableWidget(0, 1)
         self.weights.horizontalHeader().setStretchLastSection(True)
         self.weights.setMaximumHeight(195)
@@ -311,6 +384,29 @@ class TrainingPanel(QWidget):
         self.save_boxes: dict[tuple[str, str], QCheckBox] = {}
         self.save_selection_ready = False
         self.curves: dict[tuple[str, str], tuple[object, list[int], list[float]]] = {}
+        self.loss_curves: dict[tuple[tuple[str, str], str], tuple[object, list[int], list[float]]] = {}
+        self.loss_values: dict[tuple[tuple[str, str], str], list[float]] = {}
+
+    def update_duration_estimate(self):
+        if self.session.currentData() == SESSION_TEST:
+            self.duration_estimate.setText("Test duration uses the configured test image and rest times.")
+            return
+        if self.session.currentData() == SESSION_VALIDATION:
+            self.duration_estimate.setText("Validation shows each held-out image once at the selected timing.")
+            return
+        if self.persistent.isChecked():
+            self.duration_estimate.setText("Continuous mode: stop manually. Trial time follows the settings below.")
+            return
+        count = self.count.value()
+        low = count * (self.image_seconds.value() + self.fixation_min.value()) / 60
+        high = count * (self.image_seconds.value() + self.fixation_max.value()) / 60
+        wait = (self.warmup_seconds.value() / 60
+                if hasattr(self, "warmup_seconds") and self.warmup.isChecked() and self.oscar.isChecked() else 0)
+        visual = (gabor_check.TRIALS * (gabor_check.STIMULUS_MS +
+                  (gabor_check.FIXATION_MIN_MS + gabor_check.FIXATION_MAX_MS) / 2) / 60000
+                  + gabor_check.BREAK_MS / 60000) if hasattr(self, "gabor_check") and self.gabor_check.isChecked() else 0
+        self.duration_estimate.setText(f"{low + wait + visual:.1f}–{high + wait + visual:.1f} min for {count} scene trials"
+                                       + (" including visual check and break." if visual else "."))
 
     def heading_session(self, session: str):
         self.heading.setText({SESSION_TRAINING: "Scene emotion training",
@@ -356,9 +452,10 @@ class TrainingPanel(QWidget):
     def update_save_button(self):
         self.save.setEnabled(self.save_selection_ready and bool(self.selected_save_models()))
 
-    def prepare_save_selection(self, trainer: MultiTrainer):
+    def prepare_save_selection(self, trainer: MultiTrainer,
+                               available: set[tuple[str, str]] | None = None):
         for key, box in self.save_boxes.items():
-            fitted = trainer.models[key].model is not None
+            fitted = (key in available if available is not None else trainer.models[key].model is not None)
             box.setChecked(fitted)
             box.setEnabled(fitted)
         self.save_selection_ready = True
@@ -370,7 +467,8 @@ class TrainingPanel(QWidget):
             box.setEnabled(False)
         self.update_save_button()
 
-    def configure_models(self, model_keys: list[tuple[str, str]], feature_names: tuple[str, ...]):
+    def configure_models(self, model_keys: list[tuple[str, str]], feature_names: tuple[str, ...],
+                         split_mode: bool = False):
         """Reset the accuracy table, curves and weight table for a new run."""
         self.accuracy.setHorizontalHeaderLabels(("Target (+)", "Model", f"Last {ROLLING} correct", "N", "P(+)", "Save"))
         self.model_keys = list(model_keys)
@@ -380,6 +478,15 @@ class TrainingPanel(QWidget):
         if self.plot.plotItem.legend is not None:
             self.plot.plotItem.legend.clear()
         self.curves = {}
+        self.loss_plot.clear()
+        if self.loss_plot.plotItem.legend is not None:
+            self.loss_plot.plotItem.legend.clear()
+        self.loss_plot.addItem(pg.InfiniteLine(pos=.25, angle=0,
+                                               pen=pg.mkPen("#aab5c8", width=1,
+                                                            style=Qt.PenStyle.DotLine)))
+        self.loss_curves = {}
+        self.loss_values = {}
+        self.loss_plot.setVisible(split_mode)
         self.accuracy.setRowCount(len(model_keys))
         for row, (target, clf) in enumerate(model_keys):
             label = classifiers.CLASSIFIERS[clf].label
@@ -388,7 +495,8 @@ class TrainingPanel(QWidget):
                 item.setToolTip(text)
                 self.accuracy.setItem(row, col, item)
             save_box = QCheckBox()
-            save_box.setToolTip(f"Save fitted {target} / {label} model")
+            save_box.setToolTip(f"Save best held-out {target} / {label} checkpoint" if split_mode
+                                else f"Save fitted {target} / {label} model")
             save_box.setEnabled(False)
             save_box.toggled.connect(self.update_save_button)
             self.accuracy.setCellWidget(row, 5, save_box)
@@ -396,6 +504,13 @@ class TrainingPanel(QWidget):
             pen = pg.mkPen(CURVE_COLORS[row % len(CURVE_COLORS)], width=3)
             curve = self.plot.plot(pen=pen, symbol="o", symbolSize=5, name=f"{target} · {label}")
             self.curves[(target, clf)] = (curve, [], [])
+            if split_mode:
+                for role in ("training", "validation"):
+                    loss_pen = pg.mkPen(CURVE_COLORS[row % len(CURVE_COLORS)], width=2,
+                                        style=Qt.PenStyle.SolidLine if role == "training" else Qt.PenStyle.DashLine)
+                    loss_curve = self.loss_plot.plot(pen=loss_pen, name=f"{target}/{clf} · {role}")
+                    self.loss_curves[((target, clf), role)] = (loss_curve, [], [])
+                    self.loss_values[((target, clf), role)] = []
         self.weights.clear()
         self.weights.setRowCount(len(feature_names))
         self.weights.setColumnCount(1 + len(model_keys))
@@ -410,6 +525,18 @@ class TrainingPanel(QWidget):
         curve, xs, ys = self.curves[key]
         xs.append(trial)
         ys.append(value)
+        curve.setData(xs, ys)
+
+    def add_loss(self, key: tuple[str, str], role: str, trial: int,
+                 probability: float, label: int):
+        curve_key = (key, role)
+        if curve_key not in self.loss_curves:
+            return
+        values = self.loss_values[curve_key]
+        values.append((probability - label) ** 2)
+        curve, xs, ys = self.loss_curves[curve_key]
+        xs.append(trial)
+        ys.append(float(np.mean(values[-ROLLING:])))
         curve.setData(xs, ys)
 
     def update_models(self, trainer: MultiTrainer):
@@ -580,9 +707,24 @@ class FeaturePanel(QWidget):
         self.note = QLabel("Waiting for real Unicorn EEG. Diagnostics run before training.")
         self.note.setWordWrap(True)
         layout.addWidget(self.note)
+        self.source_status = QLabel("NO LIVE EEG · plots cleared · no simulated data")
+        self.source_status.setObjectName("status")
+        layout.addWidget(self.source_status)
         self.oscar_toggle = QCheckBox("Use OSCAR artifact removal (reconnects EEG)")
         self.oscar_toggle.setChecked(True)
         layout.addWidget(self.oscar_toggle)
+        display_controls = QHBoxLayout()
+        self.live_raw = QPushButton("Live EEG: On")
+        self.live_features = QPushButton("Live features: On")
+        for button, name in ((self.live_raw, "Live EEG"), (self.live_features, "Live features")):
+            button.setCheckable(True)
+            button.setChecked(True)
+            button.toggled.connect(lambda enabled, control=button, label=name:
+                                   control.setText(f"{label}: {'On' if enabled else 'Off'}"))
+            display_controls.addWidget(button)
+        self.reconnect = QPushButton("Recheck EEG connection")
+        display_controls.addWidget(self.reconnect)
+        layout.addLayout(display_controls)
         quality_title = QLabel("Electrode signal checks")
         quality_title.setObjectName("heading")
         layout.addWidget(quality_title)
@@ -595,7 +737,7 @@ class FeaturePanel(QWidget):
             quality_grid.addWidget(label, index // 2, index % 2)
             self.quality_labels.append(label)
         layout.addLayout(quality_grid)
-        quality_note = QLabel("Green/Good = provisional amplitude check; red/Bad = flat, unusually large, or invalid. This is not an impedance or scalp-contact measurement. Ratings use a filtered 2 s window of the displayed stream.")
+        quality_note = QLabel("Green/Good = provisional amplitude check; red/Bad = flat, unusually large, or too many missing scans. Each rating uses an uninterrupted real segment from the last 2 s. This is not an impedance or scalp-contact measurement.")
         quality_note.setWordWrap(True)
         layout.addWidget(quality_note)
         self.set_quality(None)
@@ -603,7 +745,7 @@ class FeaturePanel(QWidget):
         layout.addWidget(self.tabs, 1)
         diagnostic = QWidget()
         diagnostic_layout = QVBoxLayout(diagnostic)
-        self.raw_note = QLabel("Four seconds of real EEG. Each trace is median-centered for display; vertical spacing is 200 µV. Invalid scans appear as gaps. Paused during sessions.")
+        self.raw_note = QLabel("Four seconds of real EEG. Each trace is median-centered for display; vertical spacing is 200 µV. Invalid scans appear as gaps.")
         self.raw_note.setWordWrap(True)
         diagnostic_layout.addWidget(self.raw_note)
         self.raw_plot = pg.PlotWidget()
@@ -622,7 +764,7 @@ class FeaturePanel(QWidget):
         self.tabs.addTab(diagnostic, "Live EEG")
         feature_page = QWidget()
         feature_layout = QVBoxLayout(feature_page)
-        feature_note = QLabel("Diagnostic features cover all eight electrodes. Model features use the electrodes selected in the training window. Values update during sessions and freeze afterward.")
+        feature_note = QLabel("Diagnostic features cover all eight electrodes and use a rolling 1 s EEG window. Model features use the selected electrodes and the image-onset window. ERP values in this live plot are not image-onset responses.")
         feature_note.setWordWrap(True)
         feature_layout.addWidget(feature_note)
         controls = QHBoxLayout()
@@ -782,10 +924,21 @@ class PendingEpoch:
     deadline: float
     marker_code: int
     paint_to_marker_ms: float
+    role: str = "training"
+
+
+@dataclass
+class PendingGabor:
+    number: int
+    label: int
+    role: str
+    marker_code: int
+    paint_to_marker_ms: float
+    deadline: float
 
 
 def train_epoch(extractor: FeatureExtractor, spec: EpochSpec, trainer: MultiTrainer | None,
-                epoch: np.ndarray, labels: dict[str, int]):
+                epoch: np.ndarray, labels: dict[str, int], fit: bool = True):
     """Process one trial without calling Qt objects from the worker thread."""
     started = time.perf_counter()
     try:
@@ -794,7 +947,7 @@ def train_epoch(extractor: FeatureExtractor, spec: EpochSpec, trainer: MultiTrai
             raise ValueError("artifact or flat channel")
     except ValueError:
         return None, None, (time.perf_counter() - started) * 1000
-    predictions = trainer.add(vector, labels) if trainer is not None else None
+    predictions = (trainer.add(vector, labels) if fit else trainer.predict(vector, labels)) if trainer is not None else None
     return vector, predictions, (time.perf_counter() - started) * 1000
 
 
@@ -804,6 +957,8 @@ class MainWindow(QMainWindow):
         self.root = root
         self.config = AppConfig.from_dict(CONFIG if config is None else config, root)
         self.display_extractor = FeatureExtractor(self.config.eeg)
+        self.diagnostic_spec = self.display_extractor.epoch_spec(
+            max(1000, self.display_extractor.min_image_duration_ms))
         self.extractor = self.display_extractor
         self.model_channel_indices = tuple(range(len(self.config.eeg.electrodes)))
         self.quality = SignalQuality(self.config.eeg)
@@ -820,19 +975,21 @@ class MainWindow(QMainWindow):
         self.features.oscar_toggle.setChecked(self.training.oscar.isChecked())
         self.features.oscar_toggle.toggled.connect(self.training.oscar.setChecked)
         self.training.oscar.toggled.connect(self.features.oscar_toggle.setChecked)
+        self.features.reconnect.clicked.connect(self.recheck_eeg_connection)
         self.setCentralWidget(self.training)
         self.presentation_window = PanelWindow("Hot Brain · image presentation", self.presentation,
                                                 self.stop_run)
         self.features_window = PanelWindow("Hot Brain · EEG diagnostics and features", self.features)
         self.training.start_requested.connect(self.start_run)
-        self.training.stop_requested.connect(self.stop_run)
+        self.training.stop_requested.connect(lambda: self.stop_run("Stopped by operator."))
         self.stop_shortcut = QShortcut(QKeySequence(self.training.stop_key.currentText()), self)
         self.stop_shortcut.setContext(Qt.ShortcutContext.ApplicationShortcut)
         self.stop_shortcut.setEnabled(False)
-        self.stop_shortcut.activated.connect(self.stop_run)
+        self.stop_shortcut.activated.connect(lambda: self.stop_run("Stopped by operator."))
         self.training.stop_key.currentTextChanged.connect(
             lambda key: self.stop_shortcut.setKey(QKeySequence(key)))
         self.training.save_requested.connect(self.save_model)
+        self.training.open_results.clicked.connect(self.open_saved_results)
         self.training.discard_requested.connect(self.discard_run)
         self.presentation.stimulus.onset.connect(self.on_image_onset)
         self._make_device()
@@ -854,18 +1011,27 @@ class MainWindow(QMainWindow):
         self.current_trial: int | None = None
         self.running_session = SESSION_TRAINING
         self.last_decode_time = 0.0
-        self.plan: TrialPlan | OncePlan | None = None
+        self.plan: TrialPlan | InterleavedPlan | OncePlan | None = None
         self.trainer = MultiTrainer([], [], len(self.extractor.names))
         self.pending: list[PendingEpoch] = []
         # One worker preserves test-before-train order and keeps model fits off Qt's event loop.
         self.training_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="eeg-training")
         self.training_queue: deque[tuple[PendingEpoch, np.ndarray, float]] = deque()
         self.training_future: Future | None = None
+        self.checkpoint_future: Future | None = None
+        self.checkpoint_scored = False
+        self.best_models: dict[tuple[str, str], dict] = {}
+        self.heldout_vectors: list[np.ndarray] = []
+        self.heldout_labels: list[dict[str, int]] = []
+        self.epoch_roles: list[str] = []
         self.training_item: tuple[PendingEpoch, np.ndarray, float] | None = None
         self.next_trial: StimulusImage | None = None
+        self.next_trial_role = "training"
         self.active = False
         self.finishing = False
         self.ready_for_new_run = True
+        self.recorder: SessionRecorder | None = None
+        self.results_window: RunResultsWindow | None = None
         self.evaluation_valid = False
         self.split_available = False
         self.stop_reason: str | None = None
@@ -884,6 +1050,14 @@ class MainWindow(QMainWindow):
         self.epoch_values: list[dict[str, float]] = []
         self.epoch_groups: list[str] = []
         self.run_start_clock = 0.0
+        self.gabor_stage = "off"
+        self.gabor_plan: list[tuple[int, str]] = []
+        self.gabor_next: tuple[int, str] | None = None
+        self.gabor_shown = 0
+        self.gabor_pending: list[PendingGabor] = []
+        self.gabor_epochs: list[tuple[np.ndarray, int, str]] = []
+        self.gabor_future: Future | None = None
+        self.gabor_spec = EpochSpec(gabor_check.STIMULUS_MS, self.config.eeg.fs)
         self.training.session.currentIndexChanged.connect(self._on_session_changed)
         self.training.persistent.toggled.connect(self._on_session_changed)
         self.training.persistent.toggled.connect(self._refresh_evaluation_options)
@@ -902,6 +1076,7 @@ class MainWindow(QMainWindow):
         self.warmup_timer = self._precise_timer(self.begin_fixation)
         self.fixation_timer = self._precise_timer(self.show_trial)
         self.image_timer = self._precise_timer(self.end_image)
+        self.gabor_break_timer = self._precise_timer(self._begin_scene_after_gabor)
         self.training.start.setEnabled(False)
         self.training.status.setText("Waiting for live EEG samples before a session can start.")
         self.setStyleSheet("QMainWindow,QWidget{background:#182335;color:#e8effc;font-size:13px} QLabel#heading{font-size:24px;font-weight:700;margin:4px 0 10px} QLabel#metric{font-size:18px;font-weight:600;color:#6dd7bf} QLabel#warning{color:#ffb86b} QLabel#status{font-size:16px;font-weight:600} QPushButton{background:#29466c;border-radius:7px;padding:8px 12px} QPushButton:hover{background:#376293} QPushButton:disabled{background:#354155;color:#8d9aaf} QSpinBox,QDoubleSpinBox,QComboBox{background:#25364e;padding:5px;border:1px solid #627795} QTabBar::tab{padding:9px 17px}")
@@ -917,8 +1092,9 @@ class MainWindow(QMainWindow):
     def _settings_widgets(self) -> list[QWidget]:
         t = self.training
         return [t.participant, t.serial, t.count, t.persistent, t.stop_key, t.oscar, t.warmup, t.warmup_seconds,
+                t.gabor_check,
                 t.image_seconds, t.fixation_min, t.fixation_max, t.evaluation,
-                t.session, t.load_models, t.refresh_images, t.feedback_classifier,
+                t.session, t.load_models, t.refresh_images, t.feedback_classifier, t.open_results,
                 *t.electrode_boxes, *t.train_boxes.values()]
 
     # ------------------------------------------------------------------ EEG source
@@ -961,6 +1137,8 @@ class MainWindow(QMainWindow):
                 for images in groups.values() for image in images}
 
     def _validation_eligible(self) -> bool:
+        if self.eval_info.get("validation_used_for_selection"):
+            return False
         if not self.split_available or self.training.evaluation.currentData() != EVAL_SPLIT or not self.eval_models:
             return False
         if self.eval_info.get("evaluation_mode") != EVAL_SPLIT:
@@ -989,12 +1167,14 @@ class MainWindow(QMainWindow):
         prequential_ok = (not self.training.persistent.isChecked() and group_count > 0
                           and count <= capacity and count % group_count == 0)
         self.training.evaluation.model().item(0).setEnabled(prequential_ok)
-        self.training.evaluation.model().item(1).setEnabled(self.split_available)
-        if not prequential_ok and self.training.evaluation.currentData() == EVAL_PREQUENTIAL and self.split_available:
+        split_count_ok = self.training.persistent.isChecked() or count >= 2 * group_count
+        self.training.evaluation.model().item(1).setEnabled(self.split_available and split_count_ok)
+        if (not prequential_ok and self.training.evaluation.currentData() == EVAL_PREQUENTIAL
+                and self.split_available and split_count_ok):
             self.training.evaluation.setCurrentIndex(1)
             return
         mode = self.training.evaluation.currentData()
-        self.evaluation_valid = prequential_ok if mode == EVAL_PREQUENTIAL else self.split_available
+        self.evaluation_valid = prequential_ok if mode == EVAL_PREQUENTIAL else self.split_available and split_count_ok
         if mode == EVAL_SPLIT and not self.training.persistent.isChecked() and group_count:
             self.evaluation_valid = self.evaluation_valid and count % group_count == 0
         if dataset is None:
@@ -1006,11 +1186,12 @@ class MainWindow(QMainWindow):
                     f"Prequential unavailable: choose a finite multiple of {group_count} no greater than {capacity}.")
         else:
             train_capacity = balanced_unique_capacity(self.split_train)
-            note = (f"Held-out validation images never enter training. The training subset supports "
-                    f"{train_capacity} balanced presentations without repeats; longer runs repeat training images. "
-                    "Run Validation afterward for the held-out score."
-                    if self.split_available else
-                    "Split unavailable: each group needs at least one training and one validation image.")
+            note = (f"About {round(self.config.validation_fraction * 100)}% of presentations show held-out images "
+                    f"within this run; their EEG never enters fitting. The training subset supports "
+                    f"{train_capacity} balanced presentations without repeats. "
+                    "Every 20 usable training trials creates a checkpoint; the lowest held-out Brier loss wins."
+                    if self.split_available and split_count_ok else
+                    "Split unavailable: each group needs training and validation images and at least two presentations per group.")
         if not self.evaluation_valid:
             note += " No valid evaluation mode for these settings."
         self.training.evaluation_status.setText(note)
@@ -1042,12 +1223,15 @@ class MainWindow(QMainWindow):
         self.eval_models = {}
         self.eval_info = {}
         self.training.feedback_classifier.clear()
+        self.training.feedback_classifier.addItem("Train or load models first")
+        self.training.feedback_classifier.setEnabled(False)
         self.training.models_status.setText("Electrodes changed. Load matching models or train again.")
         self._refresh_validation_availability()
         self.update_start_availability()
 
     def update_timing_note(self):
         spec = self.extractor.epoch_spec(round(self.training.image_seconds.value() * 1000))
+        self.epoch_spec = spec
         self.presentation.set_timing(self.training.fixation_min.value(), self.training.fixation_max.value(), spec)
 
     def show_windows(self, available: QRect | None = None):
@@ -1075,12 +1259,28 @@ class MainWindow(QMainWindow):
             self.features.clear()
             self.last_raw_samples = 0
             self.last_raw_time = 0.0
+            self.last_feature_time = 0.0
             self.last_quality_time = 0.0
             self.features.note.setText("No live EEG stream. Diagnostics and feature values have been cleared.")
+            self.features.source_status.setText("NO LIVE EEG · plots cleared · no simulated data")
             if self.active:
                 self.stop_run("EEG stream disconnected; session stopped.")
         elif not self.active:
             self.features.note.setText("Unicorn opened. Waiting for current EEG samples.")
+        self.update_start_availability()
+
+    def recheck_eeg_connection(self):
+        if self.active or self.finishing:
+            return
+        self.features.clear()
+        self.last_raw_samples = 0
+        self.last_raw_time = 0.0
+        self.last_feature_time = 0.0
+        self.last_quality_time = 0.0
+        self.features.source_status.setText("CHECKING UNICORN · waiting for real EEG")
+        self.features.note.setText("Checking the EEG connection now…")
+        self.configure_device_from_controls()
+        self.device.retry_now()
         self.update_start_availability()
 
     def configure_device_from_controls(self):
@@ -1092,6 +1292,7 @@ class MainWindow(QMainWindow):
             self.features.clear()
             self.last_raw_samples = 0
             self.last_raw_time = 0.0
+            self.last_feature_time = 0.0
             self.last_quality_time = 0.0
             self.features.note.setText("Reconnecting EEG with updated device settings…")
         self.device.configure(oscar, serial)
@@ -1124,10 +1325,13 @@ class MainWindow(QMainWindow):
             self.training.count.setEnabled(session == SESSION_TRAINING and not self.training.persistent.isChecked())
             self.training.persistent.setEnabled(session == SESSION_TRAINING)
             self.training.evaluation.setEnabled(session == SESSION_TRAINING)
+            self.training.gabor_check.setEnabled(session == SESSION_TRAINING)
             for box in self.training.electrode_boxes:
                 box.setEnabled(session == SESSION_TRAINING)
             for box in self.training.train_boxes.values():
                 box.setEnabled(session == SESSION_TRAINING)
+            self.training.feedback_classifier.setEnabled(
+                session != SESSION_TRAINING and bool(self.eval_models))
             if session == SESSION_TRAINING:
                 self.training.update_model_limit()
         self.presentation.plane.setVisible(session != SESSION_TRAINING)
@@ -1147,6 +1351,8 @@ class MainWindow(QMainWindow):
         preferred = next((c for c in self.config.classifiers if c in classifiers_present), None)
         if preferred is not None:
             combo.setCurrentIndex(classifiers_present.index(preferred))
+        combo.setEnabled(self.session_type != SESSION_TRAINING and not (self.active or self.finishing)
+                         and bool(classifiers_present))
         duration = info.get("image_duration_s")
         self.training.models_status.setText(
             f"{len(models)} model(s) from {source}" + (f" · image {duration:g} s" if duration else ""))
@@ -1173,6 +1379,7 @@ class MainWindow(QMainWindow):
         self._set_eval_models(models, {"image_duration_s": manifest.get("image_duration_s"),
                                        "manifest": Path(path).name,
                                        "evaluation_mode": manifest.get("evaluation_mode"),
+                                       "validation_used_for_selection": manifest.get("validation_used_for_selection", False),
                                        "training_image_files": manifest.get("training_image_files", ())}, Path(path).name)
 
     def _display_targets(self) -> tuple[str, str]:
@@ -1255,15 +1462,23 @@ class MainWindow(QMainWindow):
         groups = self._session_images(session)
         if groups is None:
             return
-        for items in groups.values():
+        image_groups = [groups]
+        if session == SESSION_TRAINING and self.training.evaluation.currentData() == EVAL_SPLIT:
+            image_groups.append(self.split_validation)
+        for items in (images for group_set in image_groups for images in group_set.values()):
             for item in items:
                 if not QImageReader(str(item.path)).canRead():
                     QMessageBox.warning(self, "Image error", f"Cannot read {item.path}")
                     return
         total = None if self.training.persistent.isChecked() else self.training.count.value()
         try:
-            self.plan = (TrialPlan(groups, total, allow_repeats=self.training.evaluation.currentData() == EVAL_SPLIT)
-                         if session == SESSION_TRAINING else OncePlan(groups))
+            if session == SESSION_TRAINING and self.training.evaluation.currentData() == EVAL_SPLIT:
+                self.plan = InterleavedPlan(groups, self.split_validation, total,
+                                            self.config.validation_fraction)
+            elif session == SESSION_TRAINING:
+                self.plan = TrialPlan(groups, total, allow_repeats=False)
+            else:
+                self.plan = OncePlan(groups)
         except ValueError as exc:
             QMessageBox.warning(self, "Session images", str(exc)); return
         self.running_session = session
@@ -1272,13 +1487,16 @@ class MainWindow(QMainWindow):
             retention = max(retention, self.config.test_trial_s + 5)
         self.device.set_retention(retention)
         self.training.plot.setVisible(session == SESSION_TRAINING)
+        self.training.loss_plot.setVisible(session == SESSION_TRAINING and isinstance(self.plan, InterleavedPlan))
         self.training.weights.setVisible(session == SESSION_TRAINING)
         if session == SESSION_TRAINING:
             target_names = list(dict.fromkeys(target for target, _ in model_pairs))
             classifier_keys = list(dict.fromkeys(clf for _, clf in model_pairs))
             self.trainer = MultiTrainer(target_names, classifier_keys, len(self.extractor.names),
-                                        selected_pairs=model_pairs)
-            self.training.configure_models(list(self.trainer.models), self.extractor.names)
+                                        selected_pairs=model_pairs,
+                                        checkpoint_every=20 if isinstance(self.plan, InterleavedPlan) else None)
+            self.training.configure_models(list(self.trainer.models), self.extractor.names,
+                                           split_mode=isinstance(self.plan, InterleavedPlan))
             self.training.plot.setLabel("left", "Prequential correct" if self.training.evaluation.currentData() == EVAL_PREQUENTIAL
                                         else "Training stream correct", units="%")
         else:
@@ -1297,6 +1515,12 @@ class MainWindow(QMainWindow):
         self.training_queue.clear()
         self.training_future = None
         self.training_item = None
+        self.checkpoint_future = None
+        self.checkpoint_scored = False
+        self.best_models = {}
+        self.heldout_vectors = []
+        self.heldout_labels = []
+        self.epoch_roles = []
         self.shown = self.usable = self.skipped = 0
         self.ready_for_new_run = False
         self.stop_reason = None
@@ -1309,12 +1533,13 @@ class MainWindow(QMainWindow):
         for widget in self._settings_widgets:
             widget.setEnabled(False)
         self.features.oscar_toggle.setEnabled(False)
+        self.features.reconnect.setEnabled(False)
         self.active = True
         self.finishing = False
         self.features.clear()
         self.last_raw_samples = 0
         self.last_raw_time = 0.0
-        self.features.note.setText("Training in progress. Live EEG plot paused to protect image timing.")
+        self.features.note.setText("Training in progress. Live diagnostics follow the switches in the EEG window.")
         self.last_feature_time = 0.0
         self.last_quality_time = 0.0
         self.trial_log = []
@@ -1324,6 +1549,15 @@ class MainWindow(QMainWindow):
         self.epoch_values = []
         self.epoch_groups = []
         self.run_start_clock = time.perf_counter()
+        self.gabor_stage = "trials" if session == SESSION_TRAINING and self.training.gabor_check.isChecked() else "off"
+        self.gabor_plan = gabor_check.trial_plan() if self.gabor_stage == "trials" else []
+        self.gabor_next = None
+        self.gabor_shown = 0
+        self.gabor_pending = []
+        self.gabor_epochs = []
+        self.gabor_future = None
+        self.training.gabor_status.setText("Visual check: running…" if self.gabor_stage == "trials"
+                                           else "Visual check: off for this session.")
         self._update_counts()
         # A visible presentation window is required for paint-timed onsets.
         if not self.presentation_window.isVisible():
@@ -1340,6 +1574,7 @@ class MainWindow(QMainWindow):
                              "mode": ("persistent" if total is None else "balanced_finite") if session == SESSION_TRAINING else "each_image_once",
                              "requested_trials": total if session == SESSION_TRAINING else self.plan.total,
                              "evaluation_mode": evaluation_mode,
+                             "gabor_check_requested": self.gabor_stage == "trials",
                              "oscar_enabled": self.training.oscar.isChecked(),
                              "image_duration_s": self.epoch_spec.image_duration_ms / 1000,
                              "fixation_min_s": fixation_min, "fixation_max_s": fixation_max,
@@ -1358,17 +1593,34 @@ class MainWindow(QMainWindow):
                              "live_display_classifier": None if session == SESSION_TRAINING else self.training.feedback_classifier.currentData(),
                              "training_targets": target_names,
                              "training_model_pairs": [f"{t}/{c}" for t, c in model_pairs] if session == SESSION_TRAINING else [],
+                             "checkpoint_every_training_trials": 20 if isinstance(self.plan, InterleavedPlan) else None,
+                             "validation_used_for_selection": isinstance(self.plan, InterleavedPlan),
                              "config": self.config.raw,
                              "split": {"validation_fraction": self.config.validation_fraction if evaluation_mode == EVAL_SPLIT else 0,
                                        "seed": self.config.split_seed,
                                        "training_images": sum(len(v) for v in groups.values()) if session == SESSION_TRAINING else None,
-                                       "validation_images": sum(len(v) for v in self.split_validation.values()) if evaluation_mode == EVAL_SPLIT else 0},
+                                       "validation_images": sum(len(v) for v in self.split_validation.values()) if evaluation_mode == EVAL_SPLIT else 0,
+                                       "training_presentations": self.plan.training.total if isinstance(self.plan, InterleavedPlan) else None,
+                                       "validation_presentations": self.plan.validation.total if isinstance(self.plan, InterleavedPlan) else None},
                              "oscar_settling_requested_seconds": self.training.warmup_seconds.value() if self.training.warmup.isChecked() else 0,
                              "oscar_settling_applied_seconds": 0,
                              "dataset": session_dataset.manifest(),
-                             "session_images": [i.path.name for items in groups.values() for i in items],
+                             "session_images": [i.path.name for group_set in image_groups
+                                                for items in group_set.values() for i in items],
                              "training_image_files": sorted(self._image_files(groups)) if session == SESSION_TRAINING else [],
+                             "validation_image_files": sorted(self._image_files(self.split_validation))
+                             if isinstance(self.plan, InterleavedPlan) else [],
                              "timing_note": "g.Pype places trial markers on the Unicorn sample grid; epoch indices add the documented 40 ms device acquisition-to-host delay. OSCAR delay is handled by the pipeline. The Qt paint callback estimates visible onset; verify screen latency with a photodiode."}
+        try:
+            self.recorder = SessionRecorder(self.root / "recordings", self.run_metadata["participant_id"],
+                                            session, self.run_metadata)
+        except OSError as exc:
+            self.stop_run(f"Cannot start EEG recording: {exc}.")
+            return
+        self.device.recorder = self.recorder
+        self.run_metadata["recording_file"] = str(self.recorder.data_path.relative_to(self.root))
+        self.run_metadata["recording_manifest"] = str(self.recorder.meta_path.relative_to(self.root))
+        self.run_metadata["recording_events"] = str(self.recorder.events_path.relative_to(self.root))
         if self.training.oscar.isChecked() and self.training.warmup.isChecked():
             seconds = self.training.warmup_seconds.value()
             self.run_metadata["oscar_settling_applied_seconds"] = seconds
@@ -1376,14 +1628,69 @@ class MainWindow(QMainWindow):
             self.presentation.stimulus.fixation()
             self.warmup_timer.start(seconds * 1000)
         else:
+            self._begin_first_stage()
+
+    def _begin_first_stage(self):
+        if self.gabor_stage == "trials":
+            self._begin_gabor_fixation()
+        else:
             self.begin_fixation()
 
+    def _begin_gabor_fixation(self):
+        if not self.active or not self.ensure_eeg_stream():
+            return
+        if self.gabor_shown >= len(self.gabor_plan):
+            self.gabor_stage = "scoring"
+            self.presentation.stimulus.fixation()
+            self.training.status.setText("Visual check complete; waiting for its last EEG epochs…")
+            return
+        self.gabor_next = self.gabor_plan[self.gabor_shown]
+        self.presentation.stimulus.fixation()
+        self.training.status.setText(f"Visual check {self.gabor_shown + 1}/{len(self.gabor_plan)}")
+        self.fixation_timer.start(random.randint(gabor_check.FIXATION_MIN_MS, gabor_check.FIXATION_MAX_MS))
+
+    def _begin_scene_after_gabor(self):
+        if not self.active or not self.ensure_eeg_stream():
+            return
+        self.gabor_stage = "done"
+        self.training.status.setText("Visual check finished. Starting scene training.")
+        self.begin_fixation()
+
+    def _on_gabor_onset(self, stamp: float):
+        if not self.active or not self.ensure_eeg_stream() or self.gabor_next is None:
+            return
+        try:
+            marker_code, delay_ms = self.device.mark_image(stamp)
+        except Exception as exc:
+            self.stop_run(f"Could not mark visual check: {exc}.")
+            return
+        label, role = self.gabor_next
+        self.gabor_shown += 1
+        entry = {"kind": "gabor_onset", "number": self.gabor_shown,
+                 "stimulus": "gabor" if label else "gray", "label": label, "role": role,
+                 "onset_s_from_run_start": round(stamp - self.run_start_clock, 6),
+                 "marker_code": marker_code, "paint_to_marker_ms": round(delay_ms, 3),
+                 "stream_generation": getattr(self.device, "_generation", 0)}
+        try:
+            self.recorder.event(entry)
+        except (queue.Full, RuntimeError) as exc:
+            self.stop_run(f"EEG recording could not keep up: {exc}.")
+            return
+        self.gabor_pending.append(PendingGabor(self.gabor_shown, label, role, marker_code, delay_ms,
+                                                stamp + self.gabor_spec.end_ms / 1000 + 2))
+        self.gabor_next = None
+        self.image_timer.start(gabor_check.STIMULUS_MS)
+
     def begin_fixation(self):
+        if self.gabor_stage == "trials":
+            self._begin_gabor_fixation()
+            return
         if not self.active or not self.ensure_eeg_stream():
             return
         self.next_trial = self.plan.next() if self.plan else None
         if self.next_trial is None:
             self.stop_run(); return
+        self.next_trial_role = self.plan.last_role if isinstance(self.plan, InterleavedPlan) else "training"
         self.presentation.stimulus.fixation()
         self.training.status.setText(f"Fixation before trial {self.shown + 1}")
         if self.running_session == SESSION_TEST:
@@ -1394,12 +1701,18 @@ class MainWindow(QMainWindow):
         self.fixation_timer.start(delay)
 
     def show_trial(self):
+        if self.gabor_stage == "trials" and self.gabor_next is not None:
+            self.presentation.stimulus.visual_check(bool(self.gabor_next[0]))
+            return
         if not self.active or not self.ensure_eeg_stream() or self.next_trial is None:
             return
         self.presentation.stimulus.image(self.next_trial.path)
         # The paint callback is the closest software-side onset observation.
 
     def on_image_onset(self, stamp: float):
+        if self.gabor_stage == "trials" and self.gabor_next is not None:
+            self._on_gabor_onset(stamp)
+            return
         if not self.active or not self.ensure_eeg_stream() or self.next_trial is None:
             return
         try:
@@ -1413,9 +1726,11 @@ class MainWindow(QMainWindow):
         shown_s = self.config.test_trial_s if session == SESSION_TEST else self.epoch_spec.image_duration_ms / 1000
         if session != SESSION_TEST:
             self.pending.append(PendingEpoch(self.shown, item, stamp, stamp + self.epoch_spec.end_ms / 1000 + 2.0,
-                                             marker_code, marker_delay_ms))
+                                             marker_code, marker_delay_ms, self.next_trial_role))
         dataset = self.test_dataset if session == SESSION_TEST else self.dataset
         entry = {"number": self.shown, "group": item.group, "image": item.path.name,
+                 "trial_role": self.next_trial_role if session == SESSION_TRAINING else session,
+                 "image_path": str(item.path), "stream_generation": getattr(self.device, "_generation", 0),
                  "labels": {t: dataset.class_name(t, v) for t, v in item.labels.items()},
                  "target_values": dict(item.values),
                  "onset_s_from_run_start": round(stamp - self.run_start_clock, 6),
@@ -1435,12 +1750,21 @@ class MainWindow(QMainWindow):
             else:
                 plane.set_caption(f"Test image {self.shown}/{self.plan.total}: move ● onto ◯")
         self.trial_log.append(entry)
+        try:
+            self.recorder.event({"kind": "image_onset", **entry})
+        except (queue.Full, RuntimeError) as exc:
+            self.stop_run(f"EEG recording could not keep up: {exc}.")
+            return
         self.training.status.setText(f"Image {self.shown}: {item.group}/{item.path.name}")
         self._update_counts()
         self.next_trial = None
         self.image_timer.start(round(shown_s * 1000))
 
     def end_image(self):
+        if self.gabor_stage == "trials":
+            self.presentation.stimulus.fixation()
+            self._begin_gabor_fixation()
+            return
         if not self.active or not self.ensure_eeg_stream():
             return
         if self.running_session == SESSION_TEST:
@@ -1492,10 +1816,17 @@ class MainWindow(QMainWindow):
     def poll(self):
         now = time.perf_counter()
         self._collect_training_result()
+        self._collect_checkpoint_result()
         stream_live = self.device.stream_live()
         start_ready = self.device.stream_ready()
+        near_transition = self.active and (
+            any(timer.isActive() and 0 <= timer.remainingTime() <= 100
+                for timer in (self.warmup_timer, self.fixation_timer, self.image_timer))
+            or (self.next_trial is not None and not self.fixation_timer.isActive()))
         if self.active and not stream_live:
             self.stop_run("EEG stream stopped or timing became unreliable; training stopped.")
+        if self.active and self.recorder is not None and (self.recorder.error or self.recorder.dropped_blocks):
+            self.stop_run("EEG recording failed; session stopped to protect the data.")
         self.update_start_availability()
         if stream_live:
             device_text = (f"Unicorn {self.device.serial or '(first available)'} streaming EEG · OSCAR "
@@ -1512,27 +1843,33 @@ class MainWindow(QMainWindow):
                     or any(rating.good is not None for rating in self.features.quality_map.ratings)):
                 self.features.clear()
             self.last_raw_samples = 0
-            self.features.note.setText("No live EEG stream. Diagnostics and feature values have been cleared.")
-        elif self.active:
-            self.features.note.setText("Training in progress. Live EEG plot paused to protect image timing.")
-        elif self.finishing:
-            self.features.note.setText("Finishing pending EEG trials. Live plot paused.")
+            self.last_feature_time = 0.0
+            self.features.source_status.setText(
+                "CHECKING UNICORN · waiting for real EEG" if getattr(self.device, "_attempting", False)
+                else "NO LIVE EEG · plots cleared · no simulated data")
+            self.features.note.setText("No live EEG stream. " + self.training.device_status.text())
         else:
-            self.features.note.setText("Live EEG diagnostic. Features remain frozen outside training. OSCAR "
-                                       + ("on." if self.device.oscar else "off (unprocessed stream)."))
-            if now - self.last_raw_time >= .25:
+            self.features.source_status.setText(
+                "REAL UNICORN EEG · plots live" if (self.features.live_raw.isChecked()
+                                                    and self.features.live_features.isChecked())
+                else "REAL UNICORN EEG · one or more plots paused")
+            self.features.note.setText("Real EEG diagnostics " + ("during the session" if self.active else "before/after the session")
+                                       + ". Turn each plot on or off below. OSCAR "
+                                       + ("on." if self.device.oscar else "off."))
+            if not near_transition and self.features.live_raw.isChecked() and now - self.last_raw_time >= .25:
                 self.last_raw_time = now
                 count = self.device.ring.received_samples
                 if count != self.last_raw_samples:
                     _, raw_samples = self.device.ring.recent(4)
                     self.features.set_raw(raw_samples)
                     self.last_raw_samples = count
-        if stream_live and not self.finishing and now - self.last_quality_time >= .5:
+        if stream_live and not near_transition and not self.finishing and now - self.last_quality_time >= .5:
             self.last_quality_time = now
             _, quality_samples = self.device.ring.recent(3)
             self.features.set_quality(self.quality.assess(quality_samples))
-        if self.active and stream_live and now - self.last_feature_time >= .25:
-            spec = self.epoch_spec
+        if (stream_live and not near_transition and self.features.live_features.isChecked()
+                and now - self.last_feature_time >= .5):
+            spec = self.diagnostic_spec
             times, samples = self.device.ring.recent(max(2, spec.n_samples / spec.fs + 1))
             if len(samples) >= spec.n_samples and times[-1] > self.last_feature_time:
                 try:
@@ -1555,6 +1892,46 @@ class MainWindow(QMainWindow):
                 self.skipped += 1
             self.pending.clear()
             self._update_counts()
+        for item in self.gabor_pending[:]:
+            epoch, status = (self.device.ring.epoch_result(item.marker_code, self.gabor_spec,
+                                                            item.paint_to_marker_ms)
+                             if self.device.connected else (None, "disconnected"))
+            if epoch is not None:
+                self.gabor_epochs.append((epoch.copy(), item.label, item.role))
+                self.gabor_pending.remove(item)
+            elif status in ("invalid_scans", "expired_epoch", "incomplete_epoch") or now >= item.deadline:
+                self.gabor_pending.remove(item)
+            else:
+                break
+        if self.active and self.gabor_stage == "scoring" and not self.gabor_pending and self.gabor_future is None:
+            self.gabor_future = self.training_executor.submit(
+                gabor_check.score_gabor, list(self.gabor_epochs), self.config.eeg, self.gabor_spec)
+            self.gabor_stage = "scoring_wait"
+        if self.gabor_future is not None and self.gabor_future.done():
+            try:
+                result = self.gabor_future.result()
+            except Exception as exc:
+                result = {"status": "inconclusive", "reason": f"Analysis error: {exc}"}
+            self.gabor_future = None
+            self.run_metadata["gabor_check"] = result
+            if result["status"] == "scored":
+                verdict = "visual response detected" if result["visual_response_detected"] else "no clear visual response detected"
+                self.training.gabor_status.setText(
+                    f"Visual check: {verdict} · held-out {result['balanced_accuracy']:.0%} balanced accuracy "
+                    f"({result['usable_held_out']} trials), AUC {result['auc']:.2f}, Brier {result['brier']:.3f}.")
+            else:
+                self.training.gabor_status.setText("Visual check inconclusive: " + result.get("reason", "unknown"))
+            if self.active and self.gabor_stage == "scoring_wait":
+                self.gabor_stage = "break"
+                if result["status"] == "scored":
+                    self.training.status.setText(
+                        f"Visual check held-out: {result['balanced_accuracy']:.0%} balanced accuracy, "
+                        f"AUC {result['auc']:.2f} ({result['usable_held_out']} trials). "
+                        "Five-second break, then scene training.")
+                else:
+                    self.training.status.setText("Visual check inconclusive: " + result.get("reason", "unknown")
+                                                 + ". Five-second break, then scene training.")
+                self.gabor_break_timer.start(gabor_check.BREAK_MS)
         for item in self.pending[:]:
             epoch, epoch_status = (self.device.ring.epoch_result(
                 item.marker_code, self.epoch_spec, item.paint_to_marker_ms)
@@ -1603,7 +1980,19 @@ class MainWindow(QMainWindow):
             plane.set_caption(f"Validation image {item.number}/{self.plan.total} · correct: "
                               + (", ".join(hits) if hits else "none"))
     def _training_busy(self) -> bool:
-        return bool(self.pending or self.training_queue or self.training_future)
+        return bool(self.pending or self.training_queue or self.training_future or self.checkpoint_future
+                    or self.gabor_pending or self.gabor_future)
+
+    def _collect_checkpoint_result(self):
+        future = self.checkpoint_future
+        if future is None or not future.done():
+            return
+        self.checkpoint_future = None
+        try:
+            self.best_models = future.result()
+        except Exception as exc:
+            self.best_models = {}
+            self.run_metadata["checkpoint_error"] = f"{type(exc).__name__}: {exc}"
 
     def _start_next_training(self):
         if self.training_future is not None or not self.training_queue:
@@ -1612,10 +2001,12 @@ class MainWindow(QMainWindow):
         item, epoch, queued_at = self.training_item
         self.trial_log[item.number - 1]["training_queue_ms"] = round(
             (time.perf_counter() - queued_at) * 1000, 2)
+        args = (self.extractor, self.epoch_spec,
+                self.trainer if self.running_session == SESSION_TRAINING else None,
+                epoch[:, self.model_channel_indices], dict(item.image.labels))
         self.training_future = self.training_executor.submit(
-            train_epoch, self.extractor, self.epoch_spec,
-            self.trainer if self.running_session == SESSION_TRAINING else None,
-            epoch[:, self.model_channel_indices], dict(item.image.labels))
+            train_epoch, *args, False) if (self.running_session == SESSION_TRAINING and item.role == "validation") \
+            else self.training_executor.submit(train_epoch, *args)
 
     def _collect_training_result(self):
         future = self.training_future
@@ -1653,6 +2044,7 @@ class MainWindow(QMainWindow):
                 self.epoch_labels.append(dict(item.image.labels))
                 self.epoch_values.append(dict(item.image.values))
                 self.epoch_groups.append(item.image.group)
+                self.epoch_roles.append(item.role if self.running_session == SESSION_TRAINING else self.running_session)
                 log["eeg"] = "usable"
                 if self.running_session == SESSION_TRAINING:
                     if predictions:
@@ -1660,15 +2052,29 @@ class MainWindow(QMainWindow):
                             f"{t}/{c}": {"predicted": self.dataset.class_name(t, p.label),
                                          "p_class1": p.probability, "correct": p.correct}
                             for (t, c), p in predictions.items()}
-                        for key in predictions:
-                            self.training.add_accuracy(key, item.number, self.trainer.models[key].rolling_accuracy)
-                    self.training.update_models(self.trainer)
+                        for key, prediction in predictions.items():
+                            self.training.add_loss(key, item.role, item.number, prediction.probability,
+                                                   item.image.labels[key[0]])
+                            if item.role == "training":
+                                self.training.add_accuracy(key, item.number,
+                                                           self.trainer.models[key].rolling_accuracy)
+                    if item.role == "validation":
+                        self.heldout_vectors.append(vector)
+                        self.heldout_labels.append(dict(item.image.labels))
+                    else:
+                        self.training.update_models(self.trainer)
                 elif self.running_session == SESSION_VALIDATION:
                     self._validate_on(vector, item, log)
         self._update_counts()
 
     def _update_counts(self):
-        self.training.count_status.setText(f"Trials: {self.shown} · usable EEG: {self.usable} · skipped: {self.skipped}")
+        if self.running_session == SESSION_TRAINING and isinstance(self.plan, InterleavedPlan):
+            self.training.count_status.setText(
+                f"Trials: {self.shown} · train EEG: {self.trainer.training_trials} · "
+                f"held-out EEG: {len(self.heldout_vectors)} · skipped: {self.skipped}")
+        else:
+            self.training.count_status.setText(
+                f"Trials: {self.shown} · usable EEG: {self.usable} · skipped: {self.skipped}")
 
     def stop_run(self, reason: str | None = None):
         if not self.active:
@@ -1680,9 +2086,13 @@ class MainWindow(QMainWindow):
         self.warmup_timer.stop()
         self.fixation_timer.stop()
         self.image_timer.stop()
+        self.gabor_break_timer.stop()
         self.stop_reason = reason
+        self.run_metadata["stop_reason"] = reason or (
+            "Completed planned presentations." if self.plan is not None and self.plan.total is not None
+            and self.shown >= self.plan.total else "Stopped before planned presentations.")
         self.presentation.stimulus.idle()
-        self.features.note.setText("Finishing pending EEG trials. Live plot paused.")
+        self.features.note.setText("Finishing pending EEG trials. Live diagnostics follow the switches above.")
         self.training.stop.setEnabled(False)
         self.stop_shortcut.setEnabled(False)
         self.training.status.setText((reason + " " if reason else "") + "Finishing pending EEG epochs…")
@@ -1690,11 +2100,23 @@ class MainWindow(QMainWindow):
             self.finish_run()
 
     def finish_run(self):
+        split_run = (self.running_session == SESSION_TRAINING
+                     and self.run_metadata.get("evaluation_mode") == EVAL_SPLIT)
+        if split_run and not self.checkpoint_scored:
+            self.checkpoint_scored = True
+            self.trainer.capture_checkpoint()
+            self.training.status.setText((self.stop_reason + " " if self.stop_reason else "")
+                                         + "Scoring saved checkpoints on held-out EEG…")
+            self.checkpoint_future = self.training_executor.submit(
+                select_best_checkpoints, self.trainer.checkpoints,
+                list(self.heldout_vectors), list(self.heldout_labels))
+            return
         self.finishing = False
         session = self.running_session
         self.last_raw_time = 0.0
         self.last_quality_time = 0.0
         self.features.oscar_toggle.setEnabled(True)
+        self.features.reconnect.setEnabled(True)
         self.training.status.setText((self.stop_reason + " " if self.stop_reason else "")
                                      + f"{session.capitalize()} stopped after {self.shown} presentations; "
                                      f"{self.usable} usable EEG epochs.")
@@ -1703,15 +2125,39 @@ class MainWindow(QMainWindow):
                                   "presented_trials": self.shown, "skipped_eeg_trials": self.skipped,
                                   "trial_log": self.trial_log})
         if session == SESSION_TRAINING:
-            self.training.prepare_save_selection(self.trainer)
-            if self.trainer.any_fitted:
-                models = {k: t.model for k, t in self.trainer.models.items() if t.model is not None}
+            self.run_metadata["usable_validation_trials"] = len(self.heldout_vectors)
+            self.run_metadata["usable_training_trials"] = self.trainer.training_trials
+            if split_run:
+                self.run_metadata["checkpoint_selection"] = {
+                    f"{target}/{clf}": {field: value for field, value in selected.items() if field != "model"}
+                    for (target, clf), selected in self.best_models.items()}
+            self.training.prepare_save_selection(self.trainer,
+                                                 set(self.best_models) if split_run else None)
+            models = ({key: choice["model"] for key, choice in self.best_models.items()} if split_run else
+                      {key: t.model for key, t in self.trainer.models.items() if t.model is not None})
+            if models:
                 self._set_eval_models(models, {"image_duration_s": self.epoch_spec.image_duration_ms / 1000,
                                                "evaluation_mode": self.run_metadata["evaluation_mode"],
+                                               "validation_used_for_selection": split_run,
                                                "training_image_files": self.run_metadata["training_image_files"]},
                                       "this training run")
+                if split_run:
+                    choices = ", ".join(f"{target}/{clf}: Brier {choice['validation_brier']:.3f}, "
+                                        f"AUC {choice['validation_auc']:.3f} "
+                                        f"at {choice['training_trials']} training trials"
+                                        for (target, clf), choice in sorted(self.best_models.items()))
+                    self.training.status.setText(self.training.status.text() +
+                                                 " Best held-out Brier loss: " + choices + ".")
+                    weak = [f"{target}/{clf}" for (target, clf), choice in self.best_models.items()
+                            if not choice["beats_coinflip_brier"]]
+                    if weak:
+                        self.training.status.setText(self.training.status.text() +
+                                                     " No improvement over constant 50/50 for: "
+                                                     + ", ".join(weak) + ".")
             else:
-                self.training.status.setText(self.training.status.text() + " A model needs at least 10 usable EEG trials with both labels.")
+                reason = ("Need at least 10 usable held-out EEG trials with both labels to select a checkpoint."
+                          if split_run else "A model needs at least 10 usable EEG trials with both labels.")
+                self.training.status.setText(self.training.status.text() + " " + reason)
         else:
             summary = {f"{t}/{c}": dict(zip(("accuracy", "balanced_accuracy", "n"), self.validation.accuracy((t, c))),
                                          majority_baseline=self.validation.majority_baseline((t, c)))
@@ -1721,6 +2167,35 @@ class MainWindow(QMainWindow):
                 distances = [e["mean_distance"] for e in self.trial_log if "mean_distance" in e]
                 self.run_metadata["mean_distance"] = float(np.mean(distances)) if distances else None
             self.training.save.setEnabled(True)
+        self._archive_session()
+
+    def _archive_session(self):
+        """Always retain stream, trial log and usable epochs, even without saving a model."""
+        recorder = self.recorder
+        if recorder is None:
+            return
+        self.device.recorder = None
+        self.recorder = None
+        if self.epochs:
+            epochs_path = recorder.stem.with_suffix(".epochs.npz")
+            try:
+                targets = [t.name for t in self.config.targets]
+                self._save_epochs(epochs_path, targets, compressed=False)
+                self.run_metadata["epochs_file"] = str(epochs_path.relative_to(self.root))
+            except OSError as exc:
+                self.run_metadata["epochs_save_error"] = str(exc)
+        if self.decode_log:
+            self.run_metadata["live_decoding"] = self.decode_log
+        self.run_metadata["recording_file"] = str(recorder.data_path.relative_to(self.root))
+        self.run_metadata["recording_manifest"] = str(recorder.meta_path.relative_to(self.root))
+        self.run_metadata["recording_events"] = str(recorder.events_path.relative_to(self.root))
+        recorder.close(self.run_metadata)
+        if recorder.error or recorder.dropped_blocks:
+            self.training.status.setText(self.training.status.text() +
+                                         f" Recording incomplete: {recorder.error or 'writer queue overflow'}.")
+        else:
+            self.training.status.setText(self.training.status.text() +
+                                         f" EEG archived in recordings/{recorder.stem.name}.*")
 
     def save_model(self):
         """Save the finished session: selected trained models (training) or the session log (validation/test)."""
@@ -1735,20 +2210,15 @@ class MainWindow(QMainWindow):
         name = {SESSION_TRAINING: "scene", SESSION_VALIDATION: "validation", SESSION_TEST: "test"}[session]
         stem = directory / (f"{name}_{participant}_" + datetime.now().strftime("%Y%m%d_%H%M%S_%f"))
         if session == SESSION_TRAINING:
-            epochs_path = stem.with_suffix(".epochs.npz")
-            self.run_metadata["epochs_file"] = epochs_path.name
             try:
-                written = self.trainer.save(stem, self.run_metadata, selected)
+                written = self.trainer.save(
+                    stem, self.run_metadata, selected,
+                    self.best_models if self.run_metadata.get("evaluation_mode") == EVAL_SPLIT else None)
             except ValueError as exc:
                 QMessageBox.warning(self, "Cannot save", str(exc)); return
-            self._save_epochs(epochs_path, self.trainer.targets)
-            self.training.status.setText(f"Saved {len(written) + 1} files to saved_models/{stem.name}.*")
+            self.training.status.setText(f"Saved {len(written) - 1} model(s) and a manifest. "
+                                         f"EEG remains in {self.run_metadata.get('recording_file', 'recordings/')}.")
         else:
-            targets = [t.name for t in self.config.targets]
-            if self.epochs:
-                epochs_path = stem.with_suffix(".epochs.npz")
-                self.run_metadata["epochs_file"] = epochs_path.name
-                self._save_epochs(epochs_path, targets)
             if self.decode_log:
                 self.run_metadata["live_decoding"] = self.decode_log
             stem.with_suffix(".json").write_text(json.dumps(self.run_metadata, indent=2, default=str), encoding="utf-8")
@@ -1760,28 +2230,57 @@ class MainWindow(QMainWindow):
         self.training.settings_scroll.setVisible(True)
         self.training.discard.setEnabled(False)
         self._enable_settings()
+        self.open_saved_results(stem.with_suffix(".json"))
 
-    def _save_epochs(self, path: Path, targets: list[str]):
+    def open_saved_results(self, path: Path | None = None):
+        if path is None or isinstance(path, bool):
+            chosen, _ = QFileDialog.getOpenFileName(
+                self, "Open saved run", str(self.root / "saved_models"), "Saved run (*.json)")
+            if not chosen:
+                return
+            path = Path(chosen)
+        try:
+            viewer = RunResultsWindow(Path(path))
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            QMessageBox.warning(self, "Saved results", str(exc))
+            return
+        if self.results_window is not None:
+            self.results_window.close()
+        self.results_window = viewer
+        viewer.show()
+        viewer.raise_()
+        viewer.activateWindow()
+
+    def _save_epochs(self, path: Path, targets: list[str], compressed: bool = True):
         if not self.epochs:
             return
         labels = {f"label_{t}": np.asarray([row[t] for row in self.epoch_labels], dtype=np.uint8) for t in targets}
         labels.update({f"value_{t}": np.asarray([row[t] for row in self.epoch_values], dtype=np.float32)
                        for t in targets})
-        np.savez_compressed(path, eeg_uV=np.stack(self.epochs),
-                            trial_number=np.asarray(self.epoch_trial_numbers, dtype=np.int32),
-                            group=np.asarray(self.epoch_groups, dtype=str),
-                            channels=np.asarray(self.config.eeg.electrodes, dtype=str), **labels)
+        save = np.savez_compressed if compressed else np.savez
+        save(path, eeg_uV=np.stack(self.epochs),
+             trial_number=np.asarray(self.epoch_trial_numbers, dtype=np.int32),
+             trial_role=np.asarray(self.epoch_roles, dtype=str),
+             group=np.asarray(self.epoch_groups, dtype=str),
+             channels=np.asarray(self.config.eeg.electrodes, dtype=str), **labels)
 
     def discard_run(self):
         if self.running_session == SESSION_TRAINING:
             self.trainer = MultiTrainer([], [], len(self.extractor.names))
+            self.best_models = {}
+            self.eval_models = {}
+            self.eval_info = {}
+            self.training.feedback_classifier.clear()
+            self.training.feedback_classifier.addItem("Train or load models first")
+            self.training.feedback_classifier.setEnabled(False)
+            self.training.models_status.setText("No trained models yet.")
         self.epochs = []
         self.epoch_trial_numbers = []
         self.epoch_labels = []
         self.epoch_values = []
         self.epoch_groups = []
         self.decode_log = []
-        self.training.status.setText("Session data discarded. Ready to start again.")
+        self.training.status.setText("Models discarded; EEG and trial log remain in recordings/. Ready to start again.")
         self.ready_for_new_run = True
         self.update_start_availability()
         self.training.settings_scroll.setVisible(True)
@@ -1794,6 +2293,7 @@ class MainWindow(QMainWindow):
         for widget in self._settings_widgets:
             widget.setEnabled(True)
         self.features.oscar_toggle.setEnabled(True)
+        self.features.reconnect.setEnabled(True)
         self.training.count.setEnabled(not self.training.persistent.isChecked())
         self._on_session_changed()
 
@@ -1803,17 +2303,27 @@ class MainWindow(QMainWindow):
         self.warmup_timer.stop()
         self.fixation_timer.stop()
         self.image_timer.stop()
+        self.gabor_break_timer.stop()
+        if self.recorder is not None:
+            self.run_metadata.update({"stopped_at": datetime.now().astimezone().isoformat(),
+                                      "stop_reason": "application_closed", "trial_log": self.trial_log,
+                                      "presented_trials": self.shown})
+            self._archive_session()
         self.device.close()
         self.training_executor.shutdown(wait=False, cancel_futures=True)
         self.presentation_window.close()
         self.features_window.close()
+        if self.results_window is not None:
+            self.results_window.close()
         event.accept()
 
 
-def launch(root: Path, config: dict | None = None):
+def launch(root: Path, config: dict | None = None, results_path: Path | None = None):
     """Start the GUI. ``config`` defaults to ``hotbrain.config.CONFIG``."""
     app = QApplication.instance() or QApplication([])
     pg.setConfigOptions(antialias=True)
     window = MainWindow(root, config)
     window.show_windows()
+    if results_path is not None:
+        QTimer.singleShot(0, lambda: window.open_saved_results(results_path))
     return app.exec()

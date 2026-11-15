@@ -15,6 +15,7 @@ from PySide6.QtCore import QObject, QTimer, Signal
 
 from .config import EEGSettings
 from .features import EpochSpec, START_MS
+from .recording import SessionRecorder
 
 
 class SampleRing:
@@ -70,6 +71,7 @@ class SampleRing:
                 self._blocks.popleft()
             first_retained = self._blocks[0][0]
             self._markers = {code: index for code, index in self._markers.items() if index >= first_retained}
+        return first
 
     @property
     def latest(self) -> float:
@@ -199,6 +201,7 @@ class DeviceManager(QObject):
         self._last_error = ""
         self._attempting = False
         self._generation = 0
+        self.recorder: SessionRecorder | None = None
         self._attempt_succeeded.connect(self._connected)
         self._attempt_failed.connect(self._failed)
         self._retry = QTimer(self)
@@ -216,6 +219,21 @@ class DeviceManager(QObject):
             self._last_attempt = 0
             self._tick()
 
+    def retry_now(self):
+        """Request an immediate connection check without overlapping driver attempts."""
+        if self._attempting:
+            self.status_changed.emit("Checking for Unicorn… connection attempt in progress")
+            return
+        if self.stream_live():
+            self.status_changed.emit("Unicorn EEG is already streaming")
+            return
+        if self.connected:
+            self.disconnect()
+        self._last_attempt = 0.0
+        self._last_error = ""
+        self.status_changed.emit("Checking for Unicorn…")
+        self._tick()
+
     def _new_ring(self) -> SampleRing:
         return SampleRing(self.retention_s, self.eeg.fs, self.eeg.device_channels)
 
@@ -224,9 +242,9 @@ class DeviceManager(QObject):
         self.ring.retention_s = self.retention_s
 
     def stream_ready(self, max_age_s: float = .25) -> bool:
-        """Require a current SDK stream and enough samples for the pre-onset baseline."""
+        """Allow a live stream with recent real scans; bad trials are rejected per epoch."""
         ring = self.ring
-        return self.stream_live(max_age_s) and ring.valid_recent(.5)
+        return self.stream_live(max_age_s) and ring.any_valid_recent(.5)
 
     def stream_live(self, max_age_s: float = .5) -> bool:
         """Keep trials running through isolated bad scans, but not a real stream loss."""
@@ -249,8 +267,8 @@ class DeviceManager(QObject):
             return "EEG frames are stale"
         if not self.ring.any_valid_recent(1.0):
             return "no real Unicorn scans in the last second"
-        if not self.ring.valid_recent(.5):
-            return "waiting for 0.5 s of clean EEG before starting"
+        if not self.ring.any_valid_recent(.5):
+            return "waiting for a real EEG scan in the last 0.5 s"
         return "ready"
 
     def mark_image(self, paint_stamp: float) -> tuple[int, float]:
@@ -310,7 +328,10 @@ class DeviceManager(QObject):
                         # eight EEG and three auxiliary channels.
                         if frame.shape[1] != 12:
                             raise ValueError("Expected 8 EEG, 3 auxiliary, and 1 marker channel")
-                        ring.append(frame, marker_channel=11, validation_channel=10)
+                        first = ring.append(frame, marker_channel=11, validation_channel=10)
+                        recorder = manager.recorder
+                        if recorder is not None:
+                            recorder.append(frame, first, generation)
                     return {}
 
             pipeline = gp.Pipeline()

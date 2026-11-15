@@ -34,7 +34,7 @@ def test_stream_ready_requires_recent_sdk_frames(monkeypatch):
         assert device.ring.received_samples == EEG.fs
         assert not device.stream_ready()
         device.ring.append(np.ones((EEG.fs // 2 - 1, N_CH)))
-        assert not device.stream_ready()
+        assert device.stream_ready()
         device.ring.append(np.ones((1, N_CH)))
         assert device.stream_ready()
         with device.ring._lock:
@@ -47,7 +47,36 @@ def test_stream_ready_requires_recent_sdk_frames(monkeypatch):
         device.close()
 
 
-def test_one_bad_scan_skips_clean_start_requirement_but_keeps_live_stream(monkeypatch):
+def test_manual_recheck_resets_stale_stream_and_does_not_overlap_attempt(monkeypatch):
+    QCoreApplication.instance() or QCoreApplication([])
+    ticks = []
+    monkeypatch.setattr(DeviceManager, "_tick", lambda self: ticks.append(self._last_attempt))
+    device = DeviceManager(EEG)
+    try:
+        device._attempting = True
+        device.retry_now()
+        assert ticks == []
+        device._attempting = False
+        device.connected = True
+        closed = []
+        device.pipeline = type("PipelineStub", (), {
+            "stop": lambda self: closed.append("stop"),
+            "close": lambda self: closed.append("close"),
+            "get_condition": lambda self: "Healthy",
+        })()
+        device._last_attempt = 123.0
+        device._last_error = "previous failure"
+        device.retry_now()
+        assert closed == ["stop", "close"]
+        assert device.pipeline is None
+        assert device.ring.received_samples == 0
+        assert ticks == [0.0]
+        assert device._last_error == ""
+    finally:
+        device.close()
+
+
+def test_one_bad_scan_does_not_block_start_or_live_stream(monkeypatch):
     QCoreApplication.instance() or QCoreApplication([])
     monkeypatch.setattr(DeviceManager, "_tick", lambda self: None)
     device = DeviceManager(EEG)
@@ -59,11 +88,14 @@ def test_one_bad_scan_skips_clean_start_requirement_but_keeps_live_stream(monkey
         device.ring.append(np.ones((EEG.fs, N_CH)))
         assert device.stream_ready()
         device.ring.append(np.full((1, N_CH), np.nan))
-        assert not device.stream_ready()
+        assert device.stream_ready()
         assert device.stream_live()
         assert device.mark_image(time.perf_counter())[0] == 1
         assert emitted == [1]
-        device.ring.append(np.full((EEG.fs, N_CH), np.nan))
+        device.ring.append(np.full((EEG.fs // 2, N_CH), np.nan))
+        assert not device.stream_ready()
+        assert device.stream_live()
+        device.ring.append(np.full((EEG.fs // 2, N_CH), np.nan))
         assert not device.stream_live()
     finally:
         device.close()

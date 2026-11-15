@@ -1,9 +1,10 @@
 """Training/validation split, validation scoring and live valence-arousal decoding.
 
 Session types:
-- training:   80% of the dataset images; models learn trial by trial (test-before-train).
-- validation: the held-out 20%, each image shown once; the trained models are frozen
-              and every usable epoch is scored against the image's labels.
+- training:   split runs interleave training and held-out images in one session;
+              only training epochs fit the models. Prequential runs use unique images.
+- validation: optional extra session for legacy models not selected on these
+              held-out images; frozen models score each usable epoch.
 - test:       test images with target valence/arousal; the participant tries to match
               them while the frozen models decode valence/arousal continuously.
 """

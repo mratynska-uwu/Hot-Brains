@@ -127,7 +127,7 @@ def test_validation_uses_frozen_models_when_no_training_pairs_are_selected(tmp_p
             box.setChecked(index in (0, 2, 7))
         window.training.evaluation.setCurrentIndex(1)
         window._set_eval_models({("valence", "logreg"): FixedModel()},
-                                {"image_duration_s": 3.0, "evaluation_mode": "split",
+                                {"image_duration_s": 1.5, "evaluation_mode": "split",
                                  "training_image_files": sorted(window._image_files(window.split_train))},
                                 "test fixture")
         for box in window.training.train_boxes.values():
@@ -159,3 +159,6 @@ def test_validation_uses_frozen_models_when_no_training_pairs_are_selected(tmp_p
         assert window.run_metadata["training_model_pairs"] == []
     finally:
         window.close()
+    archived = list((tmp_path / "recordings").glob("*.session.json"))
+    assert len(archived) == 1
+    assert list((tmp_path / "recordings").glob("*.epochs.npz"))
