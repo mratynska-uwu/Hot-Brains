@@ -8,7 +8,8 @@ Run `.venv/bin/python run.py` or use the desktop launcher. The app opens three
 windows: progress, participant faces, and live EEG/feature/quality diagnostics.
 It connects to Unicorn `UN-2019.03.01` with OSCAR off by default (wet-electrode
 pilot). Once real EEG streams and at least two of PO7/Oz/PO8 pass the provisional
-signal checks, the pilot starts after a five-second countdown. No training can
+signal checks, the **Start face pilot** button becomes available. Press it to
+begin; the app never starts the pilot on its own. No training can
 start on simulated data. Press **Escape** anywhere to stop; the run also stops
 after 15 minutes at most. The three windows can be moved or maximised.
 

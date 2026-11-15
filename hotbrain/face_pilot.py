@@ -86,7 +86,7 @@ class FaceScreen(QWidget):
 
 
 class FacePilot(QMainWindow):
-    """One-button-free pilot: starts after five seconds of stable real EEG."""
+    """Manual-start pilot that requires a current real EEG stream."""
 
     def __init__(self, root: Path):
         super().__init__()
@@ -109,7 +109,7 @@ class FacePilot(QMainWindow):
         title = QLabel("Facial expression EEG pilot")
         title.setStyleSheet("font-size: 22px; font-weight: bold")
         layout.addWidget(title)
-        self.status = QLabel("Connecting to real Unicorn EEG. Pilot starts automatically.")
+        self.status = QLabel("Connecting to real Unicorn EEG. Press Start when ready.")
         self.status.setWordWrap(True)
         layout.addWidget(self.status)
         self.device_status = QLabel("Checking device…")
@@ -136,7 +136,12 @@ class FacePilot(QMainWindow):
         self.summary = QLabel("EEG responses and quiz answers will appear here.")
         self.summary.setWordWrap(True)
         layout.addWidget(self.summary)
+        self.start_button = QPushButton("Start face pilot")
+        self.start_button.setEnabled(False)
+        self.start_button.clicked.connect(self._start)
+        layout.addWidget(self.start_button)
         self.stop_button = QPushButton("Stop pilot (Escape)")
+        self.stop_button.setEnabled(False)
         self.stop_button.clicked.connect(lambda: self.finish("Stopped by participant"))
         layout.addWidget(self.stop_button)
         self.setCentralWidget(content)
@@ -155,7 +160,6 @@ class FacePilot(QMainWindow):
         self.clock.setTimerType(Qt.TimerType.PreciseTimer)
         self.clock.timeout.connect(self._tick)
         self.clock.start()
-        self.ready_since: float | None = None
         self.started = False
         self.active = False
         self.finished = False
@@ -205,7 +209,7 @@ class FacePilot(QMainWindow):
             self.features.oscar_toggle.blockSignals(False)
             return
         self.device.configure(checked, "UN-2019.03.01")
-        self.ready_since = None
+        self.posterior_good = False
 
     def _make_plan(self):
         rng = random.Random()
@@ -219,9 +223,11 @@ class FacePilot(QMainWindow):
         return [Block("control", "neutral", 0, 0, True), *pre, *training, *post]
 
     def _start(self):
-        if self.started or not self.device.stream_ready():
+        if self.started or not self.device.stream_ready() or not self.posterior_good:
             return
         self.started = self.active = True
+        self.start_button.setEnabled(False)
+        self.stop_button.setEnabled(True)
         self.run_started = time.perf_counter()
         self.started_at = datetime.now().astimezone().isoformat()
         self.plan = self._make_plan()
@@ -233,7 +239,10 @@ class FacePilot(QMainWindow):
         try:
             self.recorder = SessionRecorder(self.root / "recordings", "pilot", "face_pilot", metadata)
         except OSError as exc:
+            self.started = False
             self.active = False
+            self.start_button.setEnabled(True)
+            self.stop_button.setEnabled(False)
             self.status.setText(f"Cannot start recording: {exc}")
             return
         self.device.recorder = self.recorder
@@ -503,17 +512,15 @@ class FacePilot(QMainWindow):
             self.finish("EEG recording writer failed")
             return
         if not self.started and not self.finished:
-            if self.device.stream_ready() and self.posterior_good:
-                if self.ready_since is None:
-                    self.ready_since = now
-                remaining = max(0, 5 - (now - self.ready_since))
-                self.status.setText(f"Real EEG ready. Pilot starts automatically in {remaining:.0f} s…")
-                if remaining == 0:
-                    self._start()
-            else:
-                self.ready_since = None
-                if self.device.stream_ready():
-                    self.status.setText("Real EEG connected. Adjust the back electrodes until at least two lights are green.")
+            connected = self.device.stream_ready()
+            ready = connected and self.posterior_good
+            self.start_button.setEnabled(ready)
+            message = ("Real EEG ready. Press Start face pilot."
+                       if ready else
+                       "Real EEG connected. Adjust the back electrodes until at least two lights are green."
+                       if connected else "Waiting for real Unicorn EEG. Press Start when it is ready.")
+            if self.status.text() != message:
+                self.status.setText(message)
         if self.active and self.block and not self.quiz_step:
             elapsed = now - self.block_started
             target_frame = min(FACE_COUNT - 1, int(elapsed * BASE_HZ))
@@ -538,6 +545,7 @@ class FacePilot(QMainWindow):
         self.screen.show_message(f"Pilot ended. {reason}\nYou can remove the headset.")
         self.status.setText(reason)
         self.stop_button.setEnabled(False)
+        self.start_button.setEnabled(False)
         self.features.oscar_toggle.setEnabled(True)
         self.features.reconnect.setEnabled(True)
         if self.recorder is not None:
