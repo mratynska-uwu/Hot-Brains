@@ -1,6 +1,63 @@
-# Hot Brain scene training prototype
+# Hot Brains: a modular EEG decoding framework
 
-Participant-specific EEG decoding of emotional valence and arousal with the g.tec Unicorn headset.
+Participant-specific EEG decoding of emotional valence and arousal with the g.tec Unicorn headset. The app also runs a second experiment, sweet vs salty taste.
+
+Decoding emotions from a short dry-electrode session is hard, and the decoding goal is still open. What the project delivers is a complete framework for EEG decoding experiments. Most changes need only an edit to the config.
+
+## Framework at a glance
+
+**Core**
+
+- **Multi-target training.** Several variables (e.g. valence and arousal) are decoded at the same time. Each target has its own electrodes, bands, features and models. See [Feature configurations](#feature-configurations).
+- **Many models side by side.** Logistic regression, SVM (RBF and linear), random forest, shrinkage LDA, ridge regression, and logistic regression with nested feature selection. Up to three models per target can be compared live. Any scikit-learn estimator is added with one `register_classifier` call.
+- **Presets.** Profiles set electrodes, bands, feature families and the analysis window. Every setting can still be edited in the GUI, and **Reset to preset** restores the profile's values.
+- **Multiple experiments in one app.** Emotional scenes (valence and arousal) and [sweet vs salty taste](#taste-experiment-gorzki-smak-porażki-i-słodko-słony-sukces-). Switch from the configuration list; the headset stays connected.
+
+**Signal pipeline**
+
+- **g.Pype integration.** Stimulus markers are placed on the exact EEG sample. OSCAR removes artifacts in real time. Other g.Pype processing nodes can be added to the pipeline.
+- **Feature library.**
+  - Band power, per electrode or per region.
+  - Asymmetry and the β/α ratio.
+  - Hjorth parameters.
+  - Fractal dimension: Higuchi, Katz and Petrosian.
+  - Variance and ERP components.
+- **Artifact protection.**
+  - Amplitude-based epoch rejection.
+  - Invalid-scan detection.
+  - EMG guard and per-trial baseline correction (taste experiment).
+
+**Live views**
+
+- **Raw EEG**: eight stacked channel traces.
+- **Features**, in four views:
+  - one band across all electrodes;
+  - one electrode across all bands;
+  - fractal dimension across all electrodes;
+  - a single feature over time.
+- **Electrode contact check.** A head map rates each channel *Good / Bad / Waiting* from its signal amplitude. This is not an impedance measurement.
+
+**Experiment design**
+
+- **Between stimuli**: a fixation cross with random timing, or a neutral control image.
+- **Sessions**: training, validation, test with live feedback, calibration, resting baseline, and an optional synthetic EEG source for testing without a headset.
+- **Windows**: three separate ones (operator panel, participant display, EEG diagnostics), so the stimulus can go on a second screen.
+
+**Trustworthy results**
+
+- **Test-before-train evaluation.** Each trial is predicted before the model learns it. Validation and test sessions use frozen models.
+- **Training-quality report after every run.** It includes cross-validation, a permutation test against chance, band ablation and possible label issues.
+- **Timing.** Stimuli are marked on first paint, and the device delay is corrected.
+- **Saved output.** Models, epochs, trial logs and reports are saved, and saved models can be loaded again.
+
+**Easy to adapt**
+
+- **One config dictionary** (`hotbrain/config.py`) holds everything that differs between experiments.
+- **New dataset**: an image folder and a CSV.
+- **New target**: a CSV column or a weighted sum of columns.
+- **New classifier**: one line of code.
+- **Responsive GUI**: training runs in a background worker.
+- **Tests**: 80 automated tests (`pytest`).
 
 ## Project goals
 
@@ -50,6 +107,7 @@ macOS / Linux:
 python3 -m venv .venv
 .venv/bin/python -m pip install -r requirements-device.txt
 .venv/bin/python run.py              # Unicorn headset
+.venv/bin/python run.py --simulate   # simulated EEG, no headset (testing only)
 ```
 
 Windows (PowerShell or cmd):
@@ -58,9 +116,26 @@ Windows (PowerShell or cmd):
 py -m venv .venv
 .venv\Scripts\python -m pip install -r requirements-device.txt
 .venv\Scripts\python run.py              # Unicorn headset
+.venv\Scripts\python run.py --simulate   # simulated EEG, no headset (testing only)
 ```
 
-For inspecting the GUI without a headset, `requirements.txt` is enough. The app keeps retrying the Unicorn connection while the Qt loop remains responsive, but **training cannot start until it receives current EEG samples**. It never generates substitute EEG. `requirements-device.txt` adds the g.Pype device drivers. On macOS, grant Bluetooth permission to the application running Python. The official g.Pype package supplies `HybridBlack` and the optional `enable_oscar=True` path. [g.Pype repository](https://github.com/gtec-neurotechnology/gpype) · [device reference](https://gpype.gtec.at/content/7_sdk_reference/backend_sources/hybrid_black.html) · [platform notes](https://gpype.gtec.at/content/1_basic_concepts/supported_devices.html)
+For inspecting the GUI without a headset, `requirements.txt` is enough. The app keeps retrying the Unicorn connection while the Qt loop remains responsive, but **training cannot start until it receives current EEG samples**. It never generates substitute EEG, except in the explicitly opt-in simulation mode described below. `requirements-device.txt` adds the g.Pype device drivers. On macOS, grant Bluetooth permission to the application running Python. The official g.Pype package supplies `HybridBlack` and the optional `enable_oscar=True` path. [g.Pype repository](https://github.com/gtec-neurotechnology/gpype) · [device reference](https://gpype.gtec.at/content/7_sdk_reference/backend_sources/hybrid_black.html) · [platform notes](https://gpype.gtec.at/content/1_basic_concepts/supported_devices.html)
+
+### Simulated EEG
+
+To test the whole pipeline without a headset, choose **Headset → EEG source → Simulated EEG (testing only)** in the training window, or start with `--simulate`. This covers presentation, markers, epochs, features, signal checks, training, reports and saving. It works in both the scene and the taste experiment, and a running simulation is handed over when you switch experiments. The simulator (`hotbrain/simulation.py`) streams the eight electrodes at the configured rate in real time.
+
+- **Background**: slow drift, broadband noise, a posterior 10 Hz alpha rhythm whose amplitude waxes and wanes, weak frontal theta and central beta, 50 Hz mains hum (removed by the notch) and eye blinks at Fz every 2–6 s (40–90 µV).
+- **Every image or cue**: a visual evoked response (P1/N1 posterior, P3 parietal) with no label information.
+- **Scene images**, depending on the image's labels:
+  - *arousal 1* (emotional): an early posterior negativity (~250 ms), a centro-parietal late positive potential (0.45–1.4 s) and posterior alpha suppression;
+  - *valence 1*: left (C3, PO7) alpha suppression and more fronto-central 20 Hz beta;
+  - *valence 0*: right (C4, PO8) alpha suppression and a larger early negativity (~200 ms);
+  - unlabelled images (e.g. neutral images for valence) add nothing.
+- **Taste trials**: jaw and tongue EMG 0.5–4 s after the cue, which trips the EMG guard before the analysis window. From +2 s to the end of tasting, sweet adds frontal-midline theta and right-central alpha suppression; salty adds central 16 Hz low beta.
+- **Simulated effect** (default 4 µV) scales every label effect, and each trial's strength varies randomly (SD 50%). At 4 µV, 30 trials per condition give roughly 60–80% balanced accuracy for configurations 1 and 3. Configuration 2 is weaker (about 50–65%) because its 450 ms window misses most of the simulated effects. At **0 µV** the EEG carries no label information, so every classifier should stay at chance. This is a useful check of the evaluation itself.
+
+Simulated runs are marked `"eeg_source": "simulated"` (with `simulated_effect_uv`) in the manifest. Their saved files and reports start with `SIMULATED_`. They are for testing only and are never participant data. OSCAR, the Unicorn serial and the pretrial wait do not apply. Markers are placed on the simulator's own sample grid at the Qt paint time, so epochs are cut as with the Unicorn but without its 40 ms device delay.
 
 ## Configuration (`hotbrain/config.py`)
 
@@ -210,6 +285,7 @@ What changed compared with the original happy/sad trainer:
 - **Trial plan**: trials are balanced across the `balance_by` groups (default: valence classes) or across dataset folders, and the trial count must be a multiple of the number of groups.
 - **Saving**: save checkboxes select fitted target/model pairs. One `.joblib` per selected model, a manifest with the full config, resolved thresholds and per-trial predictions, and epochs with labels and continuous target values.
 - **GUI**: the electrode map follows the configured montage and has 10-20 positions for common electrodes.
+- **Simulated EEG**: the **EEG source** selector and `run.py --simulate` stream synthetic EEG with physiologically motivated, adjustable label effects (LPP/EPN, alpha suppression and asymmetry, taste theta/beta), for testing without a headset. Runs are marked `SIMULATED`.
 - **Tests**: updated for the new montage and features. New tests cover the real dataset, config validation, target formulas, fractal dimension and multi-model training.
 
 ## Taste experiment: "Gorzki smak porażki i słodko-słony sukces (?)"

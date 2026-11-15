@@ -30,6 +30,7 @@ from .report import build_report, clone_trainers, write_report
 from .quality import ChannelQuality, SignalQuality
 from .training import ROLLING, MultiTrainer, TrialPlan, balanced_unique_capacity
 from .affect_plane import AffectPlane
+from .simulation import DEFAULT_EFFECT_UV, SimulatedDevice, is_simulated
 from .sessions import (SESSION_CALIBRATION, SESSION_RESTING, SESSION_TEST, SESSION_TRAINING, SESSION_VALIDATION,
                        OncePlan, Smoother, ValidationScores, affect_point, calibration_images, load_models,
                        sliding_windows, split_dataset)
@@ -211,6 +212,43 @@ def _row(*widgets, stretch: bool = True) -> QWidget:
     if stretch:
         layout.addStretch()
     return holder
+
+
+SOURCE_UNICORN, SOURCE_SIMULATED = "unicorn", "simulated"
+
+
+def _source_controls(form: QFormLayout) -> tuple[QComboBox, QDoubleSpinBox]:
+    """EEG source selector (Unicorn or simulated EEG) and the simulated effect size, added to a Headset form.
+
+    The Unicorn serial and OSCAR apply only to the headset; the effect only to simulated EEG.
+    """
+    source = QComboBox()
+    source.addItem("Unicorn headset", SOURCE_UNICORN)
+    source.addItem("Simulated EEG (testing only)", SOURCE_SIMULATED)
+    source.setToolTip("Simulated EEG streams synthetic signals with label-dependent effects to test the whole "
+                      "pipeline without a headset. Runs are marked SIMULATED and are never participant data.")
+    effect = QDoubleSpinBox()
+    effect.setRange(0, 30)
+    effect.setDecimals(1)
+    effect.setSingleStep(.5)
+    effect.setSuffix(" µV")
+    effect.setValue(DEFAULT_EFFECT_UV)
+    effect.setToolTip("Strength of the simulated label effects (ERP, alpha and band power changes). "
+                      "0 = the EEG carries no label information, so classifiers should stay at chance.")
+    form.insertRow(0, "EEG source", source)
+    form.addRow("Simulated effect", effect)
+    return source, effect
+
+
+def _device_text(device) -> str:
+    """One-line description of a streaming EEG source."""
+    if is_simulated(device):
+        return device.description()
+    return f"Unicorn {device.serial or '(first available)'} streaming EEG · OSCAR " + ("on" if device.oscar else "off")
+
+
+def _simulated_prefix(metadata: dict) -> str:
+    return "SIMULATED_" if metadata.get("eeg_source") == SOURCE_SIMULATED else ""
 
 
 def _hint(text: str = "") -> QLabel:
@@ -523,6 +561,7 @@ class TrainingPanel(QWidget):
         self.oscar = QCheckBox("g.Pype OSCAR artifact removal")
         self.oscar.setChecked(True)
         form.addRow("EEG processing", self.oscar)
+        self.source, self.sim_effect = _source_controls(form)
         settings_layout.addWidget(box)
 
         # --- Images --------------------------------------------------------------------------------
@@ -653,7 +692,8 @@ class TrainingPanel(QWidget):
         self.presentation_form.setRowVisible(self.neutral_row, neutral)
 
     def input_widgets(self) -> list[QWidget]:
-        return [self.participant, self.serial, self.count, self.persistent, self.stop_key, self.oscar, self.warmup,
+        return [self.participant, self.source, self.sim_effect, self.serial, self.count, self.persistent,
+                self.stop_key, self.oscar, self.warmup,
                 self.warmup_seconds, self.image_seconds, self.between, self.fixation_min, self.fixation_max,
                 self.neutral_seconds, self.evaluation, self.configuration, self.apply_preset, self.session,
                 self.load_models, self.refresh_images, self.feedback_classifier, self.practice, self.stop_rule,
@@ -1208,7 +1248,7 @@ def resting_reference(eeg, segment: np.ndarray, window_s: float = 2.0) -> dict:
 
 
 class MainWindow(QMainWindow):
-    def __init__(self, root: Path, config: dict | None = None, device=None):
+    def __init__(self, root: Path, config: dict | None = None, device=None, simulate: bool = False):
         super().__init__()
         self.root = root
         self.handed_over = False   # True once the EEG device belongs to another experiment's window
@@ -1253,7 +1293,11 @@ class MainWindow(QMainWindow):
         self.training.save_requested.connect(self.save_model)
         self.training.discard_requested.connect(self.discard_run)
         self.presentation.stimulus.onset.connect(self.on_image_onset)
+        if simulate:
+            self.training.source.setCurrentIndex(self.training.source.findData(SOURCE_SIMULATED))
         self._make_device(device)
+        self.training.source.currentIndexChanged.connect(self._switch_source)
+        self.training.sim_effect.valueChanged.connect(self._set_sim_effect)
         self.training.serial.editingFinished.connect(self.configure_device_from_controls)
         self.training.oscar.toggled.connect(self.configure_device_from_controls)
         warnings = self.config.eeg.warnings()
@@ -1394,22 +1438,58 @@ class MainWindow(QMainWindow):
 
     # ------------------------------------------------------------------ EEG source
     def _make_device(self, device=None):
-        """Create the Unicorn EEG source, or adopt a running one handed over by another experiment."""
+        """Create the chosen EEG source (Unicorn or simulated), or adopt a running one handed over by another
+        experiment."""
         eeg = self.config.eeg
         if device is not None and (device.eeg.fs != eeg.fs
                                    or tuple(device.eeg.device_channels) != eeg.device_channels):
             device.close()
             device = None
         if device is None:
-            self.device = DeviceManager(eeg, self.training.serial.text().strip() or None)
+            self.device = (SimulatedDevice(eeg, self.training.sim_effect.value()) if self.simulated_source
+                           else DeviceManager(eeg, self.training.serial.text().strip() or None))
         else:
             self.device = device
-            self.training.serial.setText(device.serial or "")
-            self.training.oscar.setChecked(device.oscar)
+            source = self.training.source
+            source.blockSignals(True)
+            source.setCurrentIndex(source.findData(SOURCE_SIMULATED if is_simulated(device) else SOURCE_UNICORN))
+            source.blockSignals(False)
+            if is_simulated(device):
+                self.training.sim_effect.setValue(device.effect_uv)
+            else:
+                self.training.serial.setText(device.serial or "")
+                self.training.oscar.setChecked(device.oscar)
         self.device.status_changed.connect(self.training.device_status.setText)
         self.device.connected_changed.connect(self.on_connection)
-        self.training.device_status.setText("Unicorn connected (handed over)." if self.device.connected
+        name = "Simulated EEG" if is_simulated(self.device) else "Unicorn"
+        self.training.device_status.setText(f"{name} connected (handed over)." if self.device.connected
+                                            else "Starting simulated EEG…" if is_simulated(self.device)
                                             else "Checking for Unicorn…")
+
+    @property
+    def simulated_source(self) -> bool:
+        return self.training.source.currentData() == SOURCE_SIMULATED
+
+    def _switch_source(self):
+        """Replace the EEG source when the operator switches between the Unicorn and simulated EEG."""
+        if self.active or self.finishing or self.handed_over:
+            return
+        if is_simulated(self.device) == self.simulated_source:
+            return
+        self.device.status_changed.disconnect(self.training.device_status.setText)
+        self.device.connected_changed.disconnect(self.on_connection)
+        self.device.close()
+        self.features.clear()
+        self.last_raw_samples = 0
+        self.last_raw_time = 0.0
+        self.last_quality_time = 0.0
+        self._make_device()
+        self.update_start_availability()
+
+    def _set_sim_effect(self, value: float):
+        if is_simulated(self.device) and not self.active:
+            self.device.set_effect(value)
+            self.training.device_status.setText(self.device.description())
 
     def release_device(self):
         """Give the running EEG connection to another experiment's window (not closed with this one)."""
@@ -1428,10 +1508,6 @@ class MainWindow(QMainWindow):
             return
         from .taste_gui import open_taste_experiment
         return open_taste_experiment(self)
-
-    @property
-    def _source_name(self) -> str:
-        return f"Unicorn {self.device.serial or '(first available)'}"
 
     def load_dataset(self, show_errors: bool = True) -> Dataset | None:
         try:
@@ -1689,11 +1765,12 @@ class MainWindow(QMainWindow):
             if self.active:
                 self.stop_run("EEG stream disconnected; session stopped.")
         elif not self.active:
-            self.features.note.setText("Unicorn opened. Waiting for current EEG samples.")
+            self.features.note.setText(("Simulated EEG started" if is_simulated(self.device) else "Unicorn opened")
+                                       + ". Waiting for current EEG samples.")
         self.update_start_availability()
 
     def configure_device_from_controls(self):
-        if self.active or self.finishing or self.handed_over:
+        if self.active or self.finishing or self.handed_over or is_simulated(self.device):
             return
         oscar = self.training.oscar.isChecked()
         serial = self.training.serial.text().strip() or None
@@ -1737,7 +1814,8 @@ class MainWindow(QMainWindow):
         if not neutral:
             return "no neutral images found; add images to the neutral folder or choose the fixation cross."
         if not stream:
-            return "waiting for a live EEG stream from the headset."
+            return ("waiting for the simulated EEG stream." if is_simulated(self.device)
+                    else "waiting for a live EEG stream from the headset.")
         if valid:
             return "unknown reason."
         if session in (SESSION_TRAINING, SESSION_CALIBRATION):
@@ -2055,11 +2133,13 @@ class MainWindow(QMainWindow):
         model_eeg = self.config.eeg.select_electrodes(self.target_features.union_channels
                                                       or tuple(range(len(eeg.electrodes))))
         self.pre_stimulus = None
+        simulated = is_simulated(self.device)
         self.run_metadata = {"session": session,
                              "started_at": datetime.now().astimezone().isoformat(),
                              "participant_id": self.training.participant.text().strip() or "unnamed",
-                             "eeg_source": "unicorn",
-                             "unicorn_serial": self.training.serial.text().strip() or None,
+                             "eeg_source": SOURCE_SIMULATED if simulated else SOURCE_UNICORN,
+                             "simulated_effect_uv": self.device.effect_uv if simulated else None,
+                             "unicorn_serial": None if simulated else (self.training.serial.text().strip() or None),
                              "mode": ("persistent" if total is None else "balanced_finite") if session == SESSION_TRAINING
                              else session if session in (SESSION_CALIBRATION, SESSION_RESTING) else "each_image_once",
                              "requested_trials": (total if session == SESSION_TRAINING
@@ -2073,7 +2153,7 @@ class MainWindow(QMainWindow):
                              "model_kind": "state" if session == SESSION_CALIBRATION else "epoch",
                              "state_window_s": calibration["window_s"] if session == SESSION_CALIBRATION else None,
                              "calibration": calibration if session == SESSION_CALIBRATION else None,
-                             "oscar_enabled": self.training.oscar.isChecked(),
+                             "oscar_enabled": self.training.oscar.isChecked() and not simulated,
                              "image_duration_s": self.epoch_spec.image_duration_ms / 1000,
                              "fixation_min_s": fixation_min, "fixation_max_s": fixation_max,
                              "between_images": between,
@@ -2088,7 +2168,7 @@ class MainWindow(QMainWindow):
                              "epoch_sample_count": self.epoch_spec.n_samples,
                              "psd_method": eeg.psd_method, "reference": eeg.reference,
                              "artifact_max_abs_uv": eeg.artifact_max_abs_uv,
-                             "unicorn_device_delay_ms": 40,
+                             "unicorn_device_delay_ms": 0 if simulated else 40,
                              "device_delay_samples": self.device.ring.device_delay_samples,
                              "fs": eeg.fs, "channels": eeg.electrodes, "device_channels": eeg.device_channels,
                              "model_electrodes": model_eeg.electrodes,
@@ -2113,10 +2193,13 @@ class MainWindow(QMainWindow):
                              "dataset": session_dataset.manifest(),
                              "session_images": [i.path.name for items in groups.values() for i in items],
                              "training_image_files": sorted(self._image_files(groups)) if learning else [],
-                             "timing_note": "g.Pype places trial markers on the Unicorn sample grid; epoch indices add the documented 40 ms device acquisition-to-host delay. OSCAR delay is handled by the pipeline. The Qt paint callback estimates visible onset; verify screen latency with a photodiode."}
+                             "timing_note": ("SIMULATED EEG (hotbrain/simulation.py), not participant data: markers are "
+                                             "placed on the simulator's own sample grid at the Qt paint time."
+                                             if simulated else
+                                             "g.Pype places trial markers on the Unicorn sample grid; epoch indices add the documented 40 ms device acquisition-to-host delay. OSCAR delay is handled by the pipeline. The Qt paint callback estimates visible onset; verify screen latency with a photodiode.")}
         if session == SESSION_RESTING:
             self.begin_resting()
-        elif self.training.oscar.isChecked() and self.training.warmup.isChecked():
+        elif self.training.oscar.isChecked() and self.training.warmup.isChecked() and not simulated:
             seconds = self.training.warmup_seconds.value()
             self.run_metadata["oscar_settling_applied_seconds"] = seconds
             self.training.status.setText(f"Pretrial waiting: {seconds} s before first trial")
@@ -2185,6 +2268,9 @@ class MainWindow(QMainWindow):
         block_s = self.config.calibration["block_s"]
         shown_s = (self.config.test_trial_s if session == SESSION_TEST else block_s if session == SESSION_CALIBRATION
                    else self.epoch_spec.image_duration_ms / 1000)
+        if is_simulated(self.device):
+            # The simulator shapes the coming samples from this image's labels.
+            self.device.mark_stimulus(stamp, shown_s, item.labels)
         if session == SESSION_CALIBRATION:
             block_ms = round(block_s * 1000)
             spec = EpochSpec(block_ms, self.config.eeg.fs, block_ms, 0, None)
@@ -2296,15 +2382,15 @@ class MainWindow(QMainWindow):
             self.stop_run("EEG stream stopped or timing became unreliable; session stopped.")
         self.update_start_availability()
         if stream_live:
-            device_text = (f"Unicorn {self.device.serial or '(first available)'} streaming EEG · OSCAR "
-                           + ("on" if self.device.oscar else "off"))
+            device_text = _device_text(self.device)
             if self.training.device_status.text() != device_text:
                 self.training.device_status.setText(device_text)
             if start_ready and self.ready_for_new_run and self.training.status.text().startswith("Waiting for"):
                 self.training.status.setText("EEG stream ready. Start a session.")
         elif self.device.connected:
             issue = self.device.readiness_issue() if hasattr(self.device, "readiness_issue") else "EEG timing unavailable"
-            self.training.device_status.setText(f"Unicorn opened, but {issue}. Sessions disabled.")
+            name = "Simulated EEG running" if is_simulated(self.device) else "Unicorn opened"
+            self.training.device_status.setText(f"{name}, but {issue}. Sessions disabled.")
         if not stream_live:
             if (self.features.samples or self.features.raw_sample_count
                     or any(rating.good is not None for rating in self.features.quality_map.ratings)):
@@ -2316,8 +2402,9 @@ class MainWindow(QMainWindow):
         elif self.finishing:
             self.features.note.setText("Finishing pending EEG trials. Live plot paused.")
         else:
-            self.features.note.setText("Live EEG diagnostic. Features remain frozen outside sessions. OSCAR "
-                                       + ("on." if self.device.oscar else "off (unprocessed stream)."))
+            self.features.note.setText("Live EEG diagnostic. Features remain frozen outside sessions. "
+                                       + ("SIMULATED EEG, not a participant." if is_simulated(self.device)
+                                          else "OSCAR " + ("on." if self.device.oscar else "off (unprocessed stream).")))
             if now - self.last_raw_time >= .25:
                 self.last_raw_time = now
                 count = self.device.ring.received_samples
@@ -2620,7 +2707,8 @@ class MainWindow(QMainWindow):
             return
         participant = "".join(c if c.isalnum() or c in "_-" else "_"
                               for c in self.run_metadata.get("participant_id", "unnamed"))
-        self.report_stem = (f"{self.running_session}_{participant}_cfg{self.profile_number}_"
+        self.report_stem = (f"{_simulated_prefix(self.run_metadata)}{self.running_session}_{participant}_"
+                            f"cfg{self.profile_number}_"
                             + datetime.now().strftime("%Y%m%d_%H%M%S"))
         meta = {k: v for k, v in self.run_metadata.items() if k != "config"}
         info = {t: e.info for t, e in self.target_features.extractors.items()}
@@ -2656,7 +2744,8 @@ class MainWindow(QMainWindow):
         name = {SESSION_TRAINING: "scene", SESSION_CALIBRATION: "calibration", SESSION_VALIDATION: "validation",
                 SESSION_TEST: "practice_test" if self.run_metadata.get("practice") else "test",
                 SESSION_RESTING: "resting"}[session]
-        stem = directory / (f"{name}_{participant}_" + datetime.now().strftime("%Y%m%d_%H%M%S_%f"))
+        stem = directory / (f"{_simulated_prefix(self.run_metadata)}{name}_{participant}_"
+                            + datetime.now().strftime("%Y%m%d_%H%M%S_%f"))
         if learning:
             epochs_path = stem.with_suffix(".epochs.npz")
             self.run_metadata["epochs_file"] = epochs_path.name
@@ -2744,10 +2833,10 @@ class MainWindow(QMainWindow):
         event.accept()
 
 
-def launch(root: Path, config: dict | None = None):
-    """Start the GUI. ``config`` defaults to ``hotbrain.config.CONFIG``."""
+def launch(root: Path, config: dict | None = None, simulate: bool = False):
+    """Start the GUI. ``config`` defaults to ``hotbrain.config.CONFIG``; ``simulate`` starts with simulated EEG."""
     app = QApplication.instance() or QApplication([])
     pg.setConfigOptions(antialias=True)
-    window = MainWindow(root, config)
+    window = MainWindow(root, config, simulate=simulate)
     window.show_windows()
     return app.exec()

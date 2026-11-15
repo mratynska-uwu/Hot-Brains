@@ -181,6 +181,7 @@ class DeviceManager(QObject):
     connected_changed = Signal(bool)
     _attempt_succeeded = Signal(object, object, object, int)
     _attempt_failed = Signal(str, int)
+    simulated = False     # hotbrain.simulation.SimulatedDevice sets True
 
     def __init__(self, eeg: EEGSettings, serial: str | None = None):
         super().__init__()

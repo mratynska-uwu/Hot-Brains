@@ -31,11 +31,12 @@ from PySide6.QtWidgets import (
 from . import classifiers
 from .acquisition import DeviceManager
 from .features import EpochSpec, FeatureExtractor
-from .gui import (CURVE_COLORS, STYLE, FeaturePanel, PanelWindow, Stimulus, TargetEditor, _hint, _row, _section,
-                  _seconds)
+from .gui import (CURVE_COLORS, SOURCE_SIMULATED, SOURCE_UNICORN, STYLE, FeaturePanel, PanelWindow, Stimulus,
+                  TargetEditor, _device_text, _hint, _row, _section, _seconds, _simulated_prefix, _source_controls)
 from .quality import SignalQuality
 from .report import clone_trainers
 from .sessions import ValidationScores, load_models
+from .simulation import SimulatedDevice, is_simulated
 from .taste import (SALTY, SWEET, TASTE_CONFIG, TASTE_EXPERIMENT, TASTE_NAME, TASTE_TARGET, UNSUPPORTED_CLASSIFIERS,
                     UNSUPPORTED_FEATURES, TasteConfig, TasteFeatures, TasteTiming, build_taste_report, decode_trial,
                     learn_trial, taste_sequence, write_taste_report)
@@ -311,6 +312,7 @@ class TastePanel(QWidget):
         self.oscar = QCheckBox("g.Pype OSCAR artifact removal")
         self.oscar.setChecked(True)
         form.addRow("EEG processing", self.oscar)
+        self.source, self.sim_effect = _source_controls(form)
         settings.addWidget(box)
         settings.addStretch()
 
@@ -380,7 +382,7 @@ class TastePanel(QWidget):
                 self.blind, self.per_taste, self.max_run, self.fixation_min, self.fixation_max, self.trial_s,
                 self.cue_s, self.analysis_start, self.analysis_end, self.window_s, self.step_s, self.rinse_s,
                 self.warmup, self.warmup_s, self.preset, self.reset_preset, self.baseline_correction,
-                self.emg_limit, self.serial, self.oscar, *self.editor.widgets()]
+                self.emg_limit, self.source, self.sim_effect, self.serial, self.oscar, *self.editor.widgets()]
 
     def timing(self, config: TasteConfig) -> TasteTiming:
         return replace(config.timing, trial_s=self.trial_s.value(), cue_visible_s=self.cue_s.value(),
@@ -447,6 +449,8 @@ class TasteWindow(QMainWindow):
         self.taste = self._build_taste()
         self.device = None
         self._attach_device(device)
+        self.panel.source.currentIndexChanged.connect(self._switch_source)
+        self.panel.sim_effect.valueChanged.connect(self._set_sim_effect)
         self.training_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="taste-training")
         self.report_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="taste-report")
         self.future: Future | None = None
@@ -539,21 +543,52 @@ class TasteWindow(QMainWindow):
         return timer
 
     def _attach_device(self, device):
-        """Use a running device from the scene window when its wiring matches; otherwise open the Unicorn."""
+        """Use a running device from the scene window when its wiring matches; otherwise open the chosen source
+        (Unicorn or simulated EEG)."""
         eeg = self.config.eeg
+        p = self.panel
         if device is not None and (device.eeg.fs != eeg.fs or tuple(device.eeg.device_channels) != eeg.device_channels):
+            simulated = is_simulated(device)
             device.close()
             device = None
+            p.source.setCurrentIndex(p.source.findData(SOURCE_SIMULATED if simulated else SOURCE_UNICORN))
         if device is None:
-            device = DeviceManager(eeg, self.panel.serial.text().strip() or None)
+            device = (SimulatedDevice(eeg, p.sim_effect.value()) if p.source.currentData() == SOURCE_SIMULATED
+                      else DeviceManager(eeg, p.serial.text().strip() or None))
         else:
-            self.panel.serial.setText(device.serial or "")
-            self.panel.oscar.setChecked(device.oscar)
+            p.source.blockSignals(True)
+            p.source.setCurrentIndex(p.source.findData(SOURCE_SIMULATED if is_simulated(device) else SOURCE_UNICORN))
+            p.source.blockSignals(False)
+            if is_simulated(device):
+                p.sim_effect.setValue(device.effect_uv)
+            else:
+                p.serial.setText(device.serial or "")
+                p.oscar.setChecked(device.oscar)
         self.device = device
-        device.status_changed.connect(self.panel.device_status.setText)
+        device.status_changed.connect(p.device_status.setText)
         device.connected_changed.connect(self.on_connection)
-        self.panel.device_status.setText("Unicorn connected (handed over)." if device.connected
-                                         else "Checking for Unicorn…")
+        name = "Simulated EEG" if is_simulated(device) else "Unicorn"
+        p.device_status.setText(f"{name} connected (handed over)." if device.connected
+                                else "Starting simulated EEG…" if is_simulated(device) else "Checking for Unicorn…")
+
+    def _switch_source(self):
+        """Replace the EEG source when the operator switches between the Unicorn and simulated EEG."""
+        if self.active or self.finishing or self.handed_over:
+            return
+        if is_simulated(self.device) == (self.panel.source.currentData() == SOURCE_SIMULATED):
+            return
+        self.device.status_changed.disconnect(self.panel.device_status.setText)
+        self.device.connected_changed.disconnect(self.on_connection)
+        self.device.close()
+        self.features.clear()
+        self.last_raw_samples = 0
+        self._attach_device(None)
+        self.update_start_availability()
+
+    def _set_sim_effect(self, value: float):
+        if is_simulated(self.device) and not self.active:
+            self.device.set_effect(value)
+            self.panel.device_status.setText(self.device.description())
 
     def _profile(self):
         preset = self.config.profile(self.profile_number)
@@ -670,7 +705,7 @@ class TasteWindow(QMainWindow):
         self.update_start_availability()
 
     def configure_device_from_controls(self):
-        if self.active or self.finishing or self.handed_over:
+        if self.active or self.finishing or self.handed_over or is_simulated(self.device):
             return
         oscar, serial = self.panel.oscar.isChecked(), self.panel.serial.text().strip() or None
         if self.device.oscar != oscar or self.device.serial != serial:
@@ -692,7 +727,8 @@ class TasteWindow(QMainWindow):
         if not self.ready_for_new_run:
             return "save or discard the previous run first."
         if self.device is None or not self.device.stream_ready():
-            return "waiting for a live EEG stream from the headset."
+            return ("waiting for the simulated EEG stream." if is_simulated(self.device)
+                    else "waiting for a live EEG stream from the headset.")
         problems = self.panel.timing(self.config).problems()
         if problems:
             return problems[0] + "."
@@ -795,12 +831,16 @@ class TasteWindow(QMainWindow):
             self.presentation_window.show()
         self.run_start = time.perf_counter()
         eeg = self.config.eeg
+        simulated = is_simulated(self.device)
         self.run_metadata = {
             "experiment": TASTE_EXPERIMENT, "experiment_name": TASTE_NAME,
+            "eeg_source": SOURCE_SIMULATED if simulated else SOURCE_UNICORN,
+            "simulated_effect_uv": self.device.effect_uv if simulated else None,
             "session": "taste_training" if session == SESSION_TRAINING else "taste_test",
             "started_at": datetime.now().astimezone().isoformat(),
             "participant_id": p.participant.text().strip() or "unnamed",
-            "unicorn_serial": p.serial.text().strip() or None, "oscar_enabled": p.oscar.isChecked(),
+            "unicorn_serial": None if simulated else (p.serial.text().strip() or None),
+            "oscar_enabled": p.oscar.isChecked() and not simulated,
             "classes": list(self.config.classes), "label_1": self.config.classes[SWEET],
             "blind": p.blind.isChecked(),
             "cue_text": list(self.config.cue_text), "blind_cue_text": self.config.blind_cue_text,
@@ -823,10 +863,12 @@ class TasteWindow(QMainWindow):
             "psd_method": eeg.psd_method, "artifact_max_abs_uv": eeg.artifact_max_abs_uv,
             "artifact_reasons": {}, "baseline_sources": {}, "window_counts": {"total": 0, "usable": 0},
             "marked_bad_trials": 0, "config": self.config.raw,
-            "timing_note": "Cue onsets are g.Pype markers on the Unicorn sample grid (+40 ms device delay); the "
-                           "tastant contact time is not measured, so only sustained activity well after the cue "
-                           "is analysed."}
-        if p.oscar.isChecked() and p.warmup.isChecked():
+            "timing_note": ("SIMULATED EEG (hotbrain/simulation.py), not participant data: cue markers are placed "
+                            "on the simulator's own sample grid at the Qt paint time." if simulated else
+                            "Cue onsets are g.Pype markers on the Unicorn sample grid (+40 ms device delay); the "
+                            "tastant contact time is not measured, so only sustained activity well after the cue "
+                            "is analysed.")}
+        if p.oscar.isChecked() and p.warmup.isChecked() and not simulated:
             self.presentation.stimulus.fixation()
             p.status.setText(f"Settling: {p.warmup_s.value():g} s before the first trial.")
             self._operator_prepare(self.sequence[0])
@@ -880,6 +922,9 @@ class TasteWindow(QMainWindow):
             return
         timing = self.panel.timing(self.config)
         label = self.next_label
+        if is_simulated(self.device):
+            # The simulator shapes the coming samples from this trial's taste.
+            self.device.mark_stimulus(stamp, timing.trial_s, {"taste": label})
         self.next_label = None
         self.index += 1
         self.shown += 1
@@ -989,8 +1034,7 @@ class TasteWindow(QMainWindow):
             self.stop_run("EEG stream stopped or became unreliable; session stopped.")
         self.update_start_availability()
         if live:
-            text = (f"Unicorn {self.device.serial or '(first available)'} streaming EEG · OSCAR "
-                    + ("on" if self.device.oscar else "off"))
+            text = _device_text(self.device)
             if self.panel.device_status.text() != text:
                 self.panel.device_status.setText(text)
         if not live:
@@ -1204,7 +1248,8 @@ class TasteWindow(QMainWindow):
         if not any(t.x for t in self.trainer.models.values()):
             return
         participant = "".join(c if c.isalnum() or c in "_-" else "_" for c in self.run_metadata["participant_id"])
-        self.report_stem = f"taste_{participant}_cfg{self.profile_number}_" + datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.report_stem = (f"{_simulated_prefix(self.run_metadata)}taste_{participant}_cfg{self.profile_number}_"
+                            + datetime.now().strftime("%Y%m%d_%H%M%S"))
         meta = {k: v for k, v in self.run_metadata.items() if k != "config"}
         self.report_future = self.report_executor.submit(build_taste_report, clone_trainers(self.trainer.models),
                                                          meta, dict(self.config.evaluation),
@@ -1230,7 +1275,8 @@ class TasteWindow(QMainWindow):
         directory.mkdir(exist_ok=True)
         participant = "".join(c if c.isalnum() or c in "_-" else "_" for c in self.run_metadata["participant_id"])
         name = "taste" if self.running_session == SESSION_TRAINING else "taste_test"
-        stem = directory / (f"{name}_{participant}_" + datetime.now().strftime("%Y%m%d_%H%M%S_%f"))
+        stem = directory / (f"{_simulated_prefix(self.run_metadata)}{name}_{participant}_"
+                            + datetime.now().strftime("%Y%m%d_%H%M%S_%f"))
         written: list[Path] = []
         if self.epochs:
             epochs_path = stem.with_suffix(".epochs.npz")
